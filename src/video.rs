@@ -10,20 +10,85 @@ use objc2::rc::Retained;
 use objc2::{MainThreadMarker, MainThreadOnly, class, define_class, msg_send};
 use objc2_app_kit::{NSApplication, NSAutoresizingMaskOptions, NSView, NSWindowOrderingMode};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
-use std::ffi::{CString, c_char, c_int, c_uint, c_void};
+use std::cell::Cell;
+use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const VIDEO_EXTENSIONS: &[&str] = &[
     "mp4", "mov", "m4v", "mkv", "webm", "avi", "wmv", "flv", "mpg", "mpeg", "ts", "m2ts", "3gp",
 ];
 pub const SEEK_STEP: f64 = 5.0;
-/// Minimum gap between seek commands handed to libvlc.
-const SEEK_FLUSH_MS: u64 = 200;
-/// How long a sent seek keeps serving as the base/readback position while
-/// libvlc catches up.
-const SEEK_SETTLE_MS: u64 = 800;
+/// Minimum gap between seek commands handed to libvlc. Native slider events can
+/// arrive much faster than the decoder can restart, so keep only the latest
+/// target and send at a modest interactive cadence.
+const SEEK_FLUSH_MS: u64 = 50;
+/// While a seek is pending, poll often enough that throttling adds at most one
+/// display frame of latency once the flush interval expires.
+const SEEK_RETRY_MS: u64 = 16;
+/// A sent seek remains authoritative until libvlc's playback clock actually
+/// reaches the requested neighborhood. The minimum hold prevents the stale
+/// pre-seek clock from being mistaken for an acknowledgement on small seeks;
+/// the maximum prevents a broken media source from pinning the UI forever.
+const SEEK_ACK_MIN_MS: u64 = 100;
+const SEEK_ACK_MAX_MS: u64 = 5_000;
+const SEEK_ACK_TOLERANCE_SECS: f64 = 0.35;
+/// AppKit slider tracking may report the same resting target more than once
+/// around mouse-up. Re-seeking within roughly one display frame is not
+/// perceptible, but it does restart VLC's decoder and can replay the first GOP
+/// after the seek. Treat those callbacks as one logical seek.
+const SEEK_DUPLICATE_TOLERANCE_SECS: f64 = 0.02;
+const SEEK_DUPLICATE_WINDOW_MS: u64 = 250;
+const AUDIO_TRACK_RETRY_MS: u64 = 500;
+
+#[derive(Clone, Copy)]
+struct SentSeek {
+    target: f64,
+    origin: f64,
+    at: Instant,
+}
+
+/// One selectable audio stream reported by libvlc.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioTrack {
+    pub id: i32,
+    pub name: String,
+}
+
+fn seek_clock_acknowledged(
+    origin: f64,
+    target: f64,
+    actual: f64,
+    elapsed_secs: f64,
+    paused: bool,
+) -> bool {
+    let target_window_end =
+        target + if paused { 0.0 } else { elapsed_secs } + SEEK_ACK_TOLERANCE_SECS;
+    let near_requested_clock =
+        actual >= target - SEEK_ACK_TOLERANCE_SECS && actual <= target_window_end;
+
+    // For a non-trivial jump, require readback to cross the midpoint from the
+    // pre-seek clock toward the target. This rejects a stale clock even when a
+    // small tolerance window happens to overlap it.
+    let delta = target - origin;
+    let moved_toward_target = if delta.abs() <= SEEK_ACK_TOLERANCE_SECS {
+        true
+    } else {
+        let midpoint = origin + delta * 0.5;
+        if delta > 0.0 {
+            actual >= midpoint
+        } else {
+            actual <= midpoint
+        }
+    };
+
+    near_requested_clock && moved_toward_target
+}
+
+fn same_seek_target(a: f64, b: f64) -> bool {
+    (a - b).abs() <= SEEK_DUPLICATE_TOLERANCE_SECS
+}
 
 pub fn is_video_file(path: &Path) -> bool {
     crate::archive::has_ext(path, VIDEO_EXTENSIONS)
@@ -101,14 +166,31 @@ pub struct VideoPlayer {
     paused: bool,
     muted: bool,
     volume: f32,
+    /// Audio stream descriptions are immutable for the life of this player.
+    /// VLC may not expose them immediately after `play`, so retry an empty
+    /// query at a low cadence and cache the first populated list.
+    audio_tracks: Vec<AudioTrack>,
+    next_audio_track_query: Instant,
+    #[allow(dead_code)]
     scrubbing: bool,
     /// Seek target not yet handed to libvlc. Rapid seeks (key mashing, scrub
     /// drags) accumulate here and flush at most once per `SEEK_FLUSH_MS`, so
     /// libvlc never queues a backlog of demux/decode restarts.
     pending_seek: Option<f64>,
+    /// Normalized position for a playback-bar seek. Keeping this alongside the
+    /// time target lets slider seeks use VLC's direct `SET_POSITION` path
+    /// instead of `SET_TIME`, whose VLC 3 implementation may fall back to a
+    /// second position seek for demuxers that reject time seeking.
+    pending_seek_fraction: Option<f32>,
     /// Last target sent to libvlc and when; the base for chained relative
     /// seeks and the throttle clock for the next flush.
-    sent_seek: Option<(f64, std::time::Instant)>,
+    sent_seek: Cell<Option<SentSeek>>,
+    /// Last seek handed to libvlc, retained independently of `sent_seek`.
+    /// `sent_seek` is cleared as soon as VLC's clock acknowledges the jump,
+    /// which can happen before AppKit delivers a duplicate end-of-tracking
+    /// action. Keeping dispatch history separate prevents that late action
+    /// from restarting the decoder at the same frame.
+    last_dispatched_seek: Cell<Option<(f64, Instant)>>,
     /// Position to restore once libvlc's input is live — a `set_time` issued
     /// right after `play` lands before the input thread exists and is dropped.
     resume_at: Option<f64>,
@@ -121,7 +203,8 @@ pub struct VideoPlayer {
 
 impl VideoPlayer {
     pub fn open(path: &Path) -> Result<Self> {
-        let mtm = MainThreadMarker::new().ok_or_else(|| anyhow!("video must open on main thread"))?;
+        let mtm =
+            MainThreadMarker::new().ok_or_else(|| anyhow!("video must open on main thread"))?;
         let cpath = CString::new(path.to_string_lossy().into_owned())
             .map_err(|_| anyhow!("path contains a NUL byte"))?;
         let instance = Self::shared_instance()?;
@@ -144,11 +227,17 @@ impl VideoPlayer {
     /// No decompression, no buffer, no temp file.
     pub fn open_range(path: &Path, start: u64, len: u64) -> Result<Self> {
         let file = std::fs::File::open(path)?;
-        Self::open_stream(StreamSrc::File { file, start, len, pos: 0 })
+        Self::open_stream(StreamSrc::File {
+            file,
+            start,
+            len,
+            pos: 0,
+        })
     }
 
     fn open_stream(src: StreamSrc) -> Result<Self> {
-        let mtm = MainThreadMarker::new().ok_or_else(|| anyhow!("video must open on main thread"))?;
+        let mtm =
+            MainThreadMarker::new().ok_or_else(|| anyhow!("video must open on main thread"))?;
         let instance = Self::shared_instance()?;
         let src = Box::into_raw(Box::new(src));
         let media = unsafe {
@@ -209,8 +298,13 @@ impl VideoPlayer {
 
         let loop_opt = CString::new(":input-repeat=65535").unwrap();
         unsafe { libvlc_media_add_option(media, loop_opt.as_ptr()) };
-        let fast_seek = CString::new(":input-fast-seek").unwrap();
-        unsafe { libvlc_media_add_option(media, fast_seek.as_ptr()) };
+        // Keep direct timeline seeks precise. VLC's `input-fast-seek` mode
+        // deliberately favors speed over accuracy and can land on an earlier
+        // keyframe before playback catches up to the requested timestamp. That
+        // is useful for coarse thumbnail/scrub workloads, but for a single
+        // playback-bar click it shows up as a short repeated/jumped segment.
+        // We already coalesce/throttle slider traffic below, so leave VLC in
+        // its precise seek mode here.
 
         let mp = unsafe { libvlc_media_player_new_from_media(media) };
         unsafe { libvlc_media_release(media) };
@@ -243,9 +337,13 @@ impl VideoPlayer {
             paused: false,
             muted: false,
             volume: 1.0,
+            audio_tracks: Vec::new(),
+            next_audio_track_query: Instant::now(),
             scrubbing: false,
             pending_seek: None,
-            sent_seek: None,
+            pending_seek_fraction: None,
+            sent_seek: Cell::new(None),
+            last_dispatched_seek: Cell::new(None),
             resume_at: None,
             rotation: 0,
             last_layout: None,
@@ -263,7 +361,8 @@ impl VideoPlayer {
         };
         view.setWantsLayer(true);
         view.setAutoresizingMask(
-            NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
+            NSAutoresizingMaskOptions::ViewWidthSizable
+                | NSAutoresizingMaskOptions::ViewHeightSizable,
         );
         // Positioned `Below` (relative to nil) puts it at the back of the subview
         // list, so the control bar added later stays on top of the video.
@@ -286,7 +385,7 @@ impl VideoPlayer {
         }
         if self.pending_seek.is_some() {
             self.flush_seek(false);
-            egui_ctx.request_repaint_after(Duration::from_millis(50));
+            egui_ctx.request_repaint_after(Duration::from_millis(SEEK_RETRY_MS));
         }
         self.layout();
     }
@@ -308,7 +407,9 @@ impl VideoPlayer {
     /// the superview bounds are re-read every frame.
     fn layout(&mut self) {
         let (w, h) = {
-            let Some(sv) = (unsafe { self.view.superview() }) else { return };
+            let Some(sv) = (unsafe { self.view.superview() }) else {
+                return;
+            };
             let b = sv.bounds();
             (b.size.width, b.size.height)
         };
@@ -324,7 +425,10 @@ impl VideoPlayer {
                 size: NSSize::new(h, w),
             }
         } else {
-            NSRect { origin: NSPoint::new(0.0, 0.0), size: NSSize::new(w, h) }
+            NSRect {
+                origin: NSPoint::new(0.0, 0.0),
+                size: NSSize::new(w, h),
+            }
         };
         let angle = -(self.rotation as f64) * 90.0;
         let view: &VideoView = &self.view;
@@ -382,44 +486,177 @@ impl VideoPlayer {
         self.volume
     }
 
+    /// Audio streams currently known to VLC. Cache the first populated list;
+    /// one player owns one media input, so its stream descriptions do not
+    /// change during playback.
+    pub fn audio_tracks(&mut self) -> &[AudioTrack] {
+        if !self.audio_tracks.is_empty() || Instant::now() < self.next_audio_track_query {
+            return &self.audio_tracks;
+        }
+        self.next_audio_track_query = Instant::now() + Duration::from_millis(AUDIO_TRACK_RETRY_MS);
+
+        let head = unsafe { libvlc_audio_get_track_description(self.mp) };
+        let mut tracks = Vec::new();
+        let mut node = head;
+        while !node.is_null() {
+            let track = unsafe { &*node };
+            let name = if track.psz_name.is_null() {
+                format!("Audio Track {}", track.i_id)
+            } else {
+                unsafe { CStr::from_ptr(track.psz_name) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            tracks.push(AudioTrack {
+                id: track.i_id,
+                name,
+            });
+            node = track.p_next;
+        }
+        if !head.is_null() {
+            unsafe { libvlc_track_description_list_release(head) };
+        }
+        if !tracks.is_empty() {
+            self.audio_tracks = tracks;
+        }
+        &self.audio_tracks
+    }
+
+    pub fn current_audio_track(&self) -> i32 {
+        unsafe { libvlc_audio_get_track(self.mp) }
+    }
+
+    pub fn set_audio_track(&mut self, id: i32) {
+        if self.audio_tracks.iter().any(|track| track.id == id) {
+            unsafe {
+                libvlc_audio_set_track(self.mp, id);
+            }
+        }
+    }
+
     /// Seek relative to the newest requested target (not the possibly stale
     /// playback clock), so mashed presses chain into one accumulated jump.
     pub fn seek_by(&mut self, delta: f64) {
-        let base = self.pending_seek.or_else(|| self.recent_seek_target());
+        let base = self.pending_seek.or_else(|| self.in_flight_seek_target());
         let t = (base.unwrap_or_else(|| self.vlc_position()) + delta).max(0.0);
         self.seek_to(t);
     }
 
     pub fn seek_to(&mut self, target: f64) {
-        self.pending_seek = Some(target.max(0.0));
+        // An explicit user seek supersedes a deferred resume position. Without
+        // this, a click made while a newly opened input is becoming ready can
+        // be followed by the old resume target on the next update.
+        self.resume_at = None;
+        let duration = self.duration();
+        let target = if duration > 0.0 {
+            target.clamp(0.0, duration)
+        } else {
+            target.max(0.0)
+        };
+        self.pending_seek = Some(target);
+        self.pending_seek_fraction = None;
+        self.flush_seek(false);
+    }
+
+    /// Seek from a timeline fraction supplied by the playback bar. This keeps
+    /// the request in the same coordinate system all the way into VLC instead
+    /// of converting fraction -> duration -> time and asking the demuxer to
+    /// translate it back again. In VLC 3, `SET_TIME` may itself fall back to a
+    /// `SET_POSITION` request, so using position directly also guarantees one
+    /// demux seek for one playback-bar action.
+    pub fn seek_to_fraction(&mut self, fraction: f64) {
+        self.resume_at = None;
+        let fraction = fraction.clamp(0.0, 1.0);
+        let duration = self.duration();
+        let target = if duration > 0.0 {
+            fraction * duration
+        } else {
+            0.0
+        };
+        self.pending_seek = Some(target);
+        self.pending_seek_fraction = Some(fraction as f32);
         self.flush_seek(false);
     }
 
     /// Hand the pending target to libvlc, at most once per `SEEK_FLUSH_MS`
     /// unless forced. Last value wins; superseded targets are never sent.
     fn flush_seek(&mut self, force: bool) {
-        let Some(target) = self.pending_seek else { return };
-        let throttled = self
-            .sent_seek
-            .is_some_and(|(_, at)| at.elapsed() < Duration::from_millis(SEEK_FLUSH_MS));
+        let Some(target) = self.pending_seek else {
+            return;
+        };
+        let sent = self.sent_seek.get();
+
+        // AppKit can report the resting slider value again at the end of its
+        // tracking loop. Do not key this guard off `sent_seek`: playback-clock
+        // readback clears that as soon as VLC acknowledges the first jump,
+        // sometimes before the duplicate UI action arrives. A second decoder
+        // restart at the same timestamp is what makes the first scene after a
+        // seek visibly play twice.
+        if self.last_dispatched_seek.get().is_some_and(|(last, at)| {
+            at.elapsed() < Duration::from_millis(SEEK_DUPLICATE_WINDOW_MS)
+                && same_seek_target(last, target)
+        }) {
+            self.pending_seek = None;
+            self.pending_seek_fraction = None;
+            return;
+        }
+
+        let throttled =
+            sent.is_some_and(|sent| sent.at.elapsed() < Duration::from_millis(SEEK_FLUSH_MS));
         if throttled && !force {
             return;
         }
+        let fraction = self.pending_seek_fraction;
         self.pending_seek = None;
-        self.sent_seek = Some((target, std::time::Instant::now()));
-        unsafe { libvlc_media_player_set_time(self.mp, (target * 1000.0) as i64) };
+        self.pending_seek_fraction = None;
+        let now = Instant::now();
+        self.sent_seek.set(Some(SentSeek {
+            target,
+            origin: self.vlc_position(),
+            at: now,
+        }));
+        self.last_dispatched_seek.set(Some((target, now)));
+        unsafe {
+            if let Some(fraction) = fraction {
+                libvlc_media_player_set_position(self.mp, fraction);
+            } else {
+                libvlc_media_player_set_time(self.mp, (target * 1000.0) as i64);
+            }
+        }
     }
 
-    /// The last sent target, while libvlc is still likely working on it.
-    fn recent_seek_target(&self) -> Option<f64> {
-        self.sent_seek
-            .filter(|(_, at)| at.elapsed() < Duration::from_millis(SEEK_SETTLE_MS))
-            .map(|(t, _)| t)
+    /// Return the last sent target until libvlc's clock demonstrates that the
+    /// seek landed. Once acknowledged, clear it permanently so a later loop or
+    /// clock discontinuity cannot resurrect an old optimistic position.
+    fn in_flight_seek_target(&self) -> Option<f64> {
+        let sent = self.sent_seek.get()?;
+        let elapsed = sent.at.elapsed();
+        if elapsed >= Duration::from_millis(SEEK_ACK_MAX_MS) {
+            self.sent_seek.set(None);
+            return None;
+        }
+
+        if elapsed >= Duration::from_millis(SEEK_ACK_MIN_MS) {
+            let actual = self.vlc_position();
+            if seek_clock_acknowledged(
+                sent.origin,
+                sent.target,
+                actual,
+                elapsed.as_secs_f64(),
+                self.paused,
+            ) {
+                self.sent_seek.set(None);
+                return None;
+            }
+        }
+
+        Some(sent.target)
     }
 
     /// libvlc has no separate keyframe seek, so scrubbing reuses the plain seek.
     /// Each intermediate seek restarts the decoder and spits out a burst of audio,
     /// so mute the output for the duration of the drag and restore it in `end_scrub`.
+    #[allow(dead_code)] // the native slider seeks directly; kept for scrub UX
     pub fn scrub_to(&mut self, target: f64) {
         if !self.scrubbing {
             self.scrubbing = true;
@@ -430,6 +667,7 @@ impl VideoPlayer {
 
     /// Finish a scrub: land on the final drag position, then undo the
     /// scrub-time mute, leaving the user's mute intact.
+    #[allow(dead_code)]
     pub fn end_scrub(&mut self) {
         if self.scrubbing {
             self.scrubbing = false;
@@ -444,7 +682,7 @@ impl VideoPlayer {
     pub fn position(&self) -> f64 {
         self.resume_at
             .or(self.pending_seek)
-            .or_else(|| self.recent_seek_target())
+            .or_else(|| self.in_flight_seek_target())
             .unwrap_or_else(|| self.vlc_position())
     }
 
@@ -466,6 +704,38 @@ impl VideoPlayer {
     }
     pub fn is_muted(&self) -> bool {
         self.muted
+    }
+}
+
+#[cfg(test)]
+mod seek_tests {
+    use super::*;
+
+    #[test]
+    fn stale_clock_does_not_ack_forward_seek() {
+        assert!(!seek_clock_acknowledged(10.0, 50.0, 10.2, 0.2, false));
+    }
+
+    #[test]
+    fn stale_clock_does_not_ack_backward_seek() {
+        assert!(!seek_clock_acknowledged(50.0, 10.0, 50.2, 0.2, false));
+    }
+
+    #[test]
+    fn landed_seek_acknowledges_while_playing() {
+        assert!(seek_clock_acknowledged(10.0, 50.0, 50.2, 0.2, false));
+    }
+
+    #[test]
+    fn paused_seek_requires_target_neighborhood() {
+        assert!(!seek_clock_acknowledged(10.0, 50.0, 49.0, 2.0, true));
+        assert!(seek_clock_acknowledged(10.0, 50.0, 50.1, 2.0, true));
+    }
+
+    #[test]
+    fn duplicate_slider_targets_within_one_frame_are_equivalent() {
+        assert!(same_seek_target(50.0, 50.015));
+        assert!(!same_seek_target(50.0, 50.025));
     }
 }
 
@@ -543,7 +813,12 @@ enum StreamSrc {
     Mem { data: Vec<u8>, pos: usize },
     /// A byte range of a file on disk (a stored zip entry), served with pread
     /// — no decompression and no buffering beyond libvlc's own.
-    File { file: std::fs::File, start: u64, len: u64, pos: u64 },
+    File {
+        file: std::fs::File,
+        start: u64,
+        len: u64,
+        pos: u64,
+    },
 }
 
 impl StreamSrc {
@@ -562,7 +837,11 @@ impl StreamSrc {
     }
 }
 
-unsafe extern "C" fn src_open(opaque: *mut c_void, datap: *mut *mut c_void, sizep: *mut u64) -> c_int {
+unsafe extern "C" fn src_open(
+    opaque: *mut c_void,
+    datap: *mut *mut c_void,
+    sizep: *mut u64,
+) -> c_int {
     let s = unsafe { &mut *opaque.cast::<StreamSrc>() };
     // The `:input-repeat` loop reopens the stream: rewind, don't reallocate.
     s.set_pos(0);
@@ -582,7 +861,12 @@ unsafe extern "C" fn src_read(opaque: *mut c_void, buf: *mut u8, len: usize) -> 
             *pos += n;
             n as isize
         }
-        StreamSrc::File { file, start, len: total, pos } => {
+        StreamSrc::File {
+            file,
+            start,
+            len: total,
+            pos,
+        } => {
             use std::os::unix::fs::FileExt;
             let n = len.min(total.saturating_sub(*pos) as usize);
             let out = unsafe { std::slice::from_raw_parts_mut(buf, n) };
@@ -617,6 +901,13 @@ enum libvlc_media_t {}
 #[allow(non_camel_case_types)]
 enum libvlc_media_player_t {}
 
+#[repr(C)]
+struct libvlc_track_description_t {
+    i_id: c_int,
+    psz_name: *mut c_char,
+    p_next: *mut libvlc_track_description_t,
+}
+
 type MediaOpenCb = unsafe extern "C" fn(*mut c_void, *mut *mut c_void, *mut u64) -> c_int;
 type MediaReadCb = unsafe extern "C" fn(*mut c_void, *mut u8, usize) -> isize;
 type MediaSeekCb = unsafe extern "C" fn(*mut c_void, u64) -> c_int;
@@ -624,7 +915,10 @@ type MediaCloseCb = unsafe extern "C" fn(*mut c_void);
 
 unsafe extern "C" {
     fn libvlc_new(argc: c_int, argv: *const *const c_char) -> *mut libvlc_instance_t;
-    fn libvlc_media_new_path(inst: *mut libvlc_instance_t, path: *const c_char) -> *mut libvlc_media_t;
+    fn libvlc_media_new_path(
+        inst: *mut libvlc_instance_t,
+        path: *const c_char,
+    ) -> *mut libvlc_media_t;
     fn libvlc_media_new_callbacks(
         inst: *mut libvlc_instance_t,
         open_cb: Option<MediaOpenCb>,
@@ -643,6 +937,7 @@ unsafe extern "C" {
     fn libvlc_media_player_set_nsobject(mp: *mut libvlc_media_player_t, drawable: *mut c_void);
     fn libvlc_media_player_get_time(mp: *mut libvlc_media_player_t) -> i64;
     fn libvlc_media_player_set_time(mp: *mut libvlc_media_player_t, t: i64);
+    fn libvlc_media_player_set_position(mp: *mut libvlc_media_player_t, position: f32);
     fn libvlc_media_player_get_length(mp: *mut libvlc_media_player_t) -> i64;
     fn libvlc_video_take_snapshot(
         mp: *mut libvlc_media_player_t,
@@ -653,4 +948,10 @@ unsafe extern "C" {
     ) -> c_int;
     fn libvlc_audio_set_volume(mp: *mut libvlc_media_player_t, volume: c_int) -> c_int;
     fn libvlc_audio_set_mute(mp: *mut libvlc_media_player_t, status: c_int);
+    fn libvlc_audio_get_track_description(
+        mp: *mut libvlc_media_player_t,
+    ) -> *mut libvlc_track_description_t;
+    fn libvlc_track_description_list_release(tracks: *mut libvlc_track_description_t);
+    fn libvlc_audio_get_track(mp: *mut libvlc_media_player_t) -> c_int;
+    fn libvlc_audio_set_track(mp: *mut libvlc_media_player_t, track: c_int) -> c_int;
 }

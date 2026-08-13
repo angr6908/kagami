@@ -25,7 +25,11 @@ pub fn is_pdf_file(path: &Path) -> bool {
 /// re-encode round trip), while an embedded JPEG/JPEG2000 is passed through
 /// as-is for the shared image decoder to handle.
 pub enum PdfImage {
-    Rgba { width: u32, height: u32, data: Vec<u8> },
+    Rgba {
+        width: u32,
+        height: u32,
+        data: Vec<u8>,
+    },
     Encoded(Vec<u8>),
 }
 
@@ -140,11 +144,14 @@ fn page_image(doc: &Document, page_id: ObjectId) -> Option<ObjectId> {
 
 /// A page's XObject dictionary, resolving Resources inherited from an ancestor
 /// in the page tree (the spec allows /Resources on any parent node).
-fn page_xobjects<'a>(doc: &'a Document, page_id: ObjectId) -> Option<&'a Dictionary> {
+fn page_xobjects(doc: &Document, page_id: ObjectId) -> Option<&Dictionary> {
     let mut node = page_id;
     for _ in 0..64 {
         let dict = doc.get_dictionary(node).ok()?;
-        if let Some(res) = dict.get(b"Resources").ok().and_then(|o| resolve_dict(doc, o))
+        if let Some(res) = dict
+            .get(b"Resources")
+            .ok()
+            .and_then(|o| resolve_dict(doc, o))
             && let Some(xo) = res.get(b"XObject").ok().and_then(|o| resolve_dict(doc, o))
         {
             return Some(xo);
@@ -192,7 +199,11 @@ fn extract_image(doc: &Document, stream: &Stream) -> Option<PdfImage> {
     let raw = stream.decompressed_content().ok()?;
     let cs = color_space(doc, dict.get(b"ColorSpace").ok()?)?;
     let data = samples_to_rgba(&raw, width, height, bpc, &cs)?;
-    Some(PdfImage::Rgba { width, height, data })
+    Some(PdfImage::Rgba {
+        width,
+        height,
+        data,
+    })
 }
 
 /// A PDF colour space, reduced to what we need to expand samples to RGB.
@@ -201,7 +212,10 @@ enum ColorSpace {
     Rgb,
     Cmyk,
     /// A palette: `base` component count and the packed lookup table.
-    Indexed { base: usize, palette: Vec<u8> },
+    Indexed {
+        base: usize,
+        palette: Vec<u8>,
+    },
 }
 
 fn color_space(doc: &Document, obj: &Object) -> Option<ColorSpace> {
@@ -378,7 +392,11 @@ fn filter_names(doc: &Document, dict: &Dictionary) -> Vec<Vec<u8>> {
         Some(Object::Name(n)) => vec![n.clone()],
         Some(Object::Array(arr)) => arr
             .iter()
-            .filter_map(|o| resolve(doc, o).and_then(|o| o.as_name().ok()).map(<[u8]>::to_vec))
+            .filter_map(|o| {
+                resolve(doc, o)
+                    .and_then(|o| o.as_name().ok())
+                    .map(<[u8]>::to_vec)
+            })
             .collect(),
         _ => Vec::new(),
     }

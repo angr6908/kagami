@@ -7,7 +7,9 @@ rust-version = "1.92"
 [dependencies]
 # wgpu backend only (the code reads wgpu_render_state); default_fonts for text.
 # default-features off drops glow, accesskit and the x11/wayland/web backends.
-eframe = { version = "0.34", default-features = false, features = ["wgpu", "default_fonts"] }
+eframe = { version = "0.34", default-features = false, features = ["wgpu", "default_fonts", "persistence"] }
+# Persist the playback-panel position across launches (eframe's `save`/`load`).
+serde = { version = "1", features = ["derive"] }
 # Decodes every supported format (JPEG via zune-jpeg, PNG via png, etc.) and does
 # the downscale. eframe already pulls `image` in, so depending on it is free.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "tiff"] }
@@ -39,13 +41,18 @@ lopdf = { version = "0.44", default-features = false }
 # activation so the window comes to the front. The objc2 crates are already in
 # the tree (eframe/winit pull them), so depending on them is cheap.
 [target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString", "NSGeometry", "NSURL", "NSDate", "NSRunLoop"] }
 objc2-app-kit = { version = "0.3", features = [
+    "block2",
     "NSResponder", "NSWindow", "NSPanel", "NSSavePanel", "NSOpenPanel",
     "NSApplication", "NSRunningApplication", "NSEvent",
-    "NSView", "NSVisualEffectView", "NSControl", "NSSlider", "NSButton",
+    "NSView", "NSVisualEffectView", "NSGlassEffectView", "NSControl", "NSSlider", "NSButton",
     "NSTextField", "NSText", "NSImage", "NSImageView", "NSColor", "NSFont",
+    "NSHapticFeedback", "NSCell", "NSActionCell", "NSSliderCell",
+    "NSButtonCell", "NSBezierPath", "NSGraphicsContext", "NSFontDescriptor", "NSAppearance", "NSShadow",
+    "NSMenu", "NSMenuItem",
 ] }
 
 # Folder picker for non-macOS platforms (macOS uses NSOpenPanel above).

@@ -28,19 +28,29 @@ pub fn is_archive_file(path: &Path) -> bool {
 pub enum Item {
     File(PathBuf),
     /// `archive` is shared across all entries of the same archive.
-    Archived { archive: Arc<PathBuf>, entry: String },
+    Archived {
+        archive: Arc<PathBuf>,
+        entry: String,
+    },
     /// One page's embedded image inside an image-only PDF. `doc` (the parsed
     /// PDF) is shared across every page, as `archive` is across zip entries;
     /// `name` is a synthetic image filename giving the page its order and title.
     /// `inner` names the PDF's entry within its archive when the PDF is itself
     /// nested inside a zip/cbz, and is None for a plain PDF file on disk.
-    Pdf { doc: Arc<crate::pdf::PdfDoc>, page: usize, inner: Option<String>, name: String },
+    Pdf {
+        doc: Arc<crate::pdf::PdfDoc>,
+        page: usize,
+        inner: Option<String>,
+        name: String,
+    },
     /// An archive or PDF that has not been opened yet. Reading it to list its
     /// entries forces the whole (often large) file to download on OneDrive, so
     /// it stays a single placeholder slot in the browse list — sorted where the
     /// file lives — until the viewer navigates near it, then it is expanded in
     /// place into its real entries. See `KagamiApp::maybe_expand`.
-    Container { path: Arc<PathBuf> },
+    Container {
+        path: Arc<PathBuf>,
+    },
 }
 
 impl Item {
@@ -105,7 +115,9 @@ impl Item {
             Item::Archived { archive, entry } => {
                 format!("{}/{entry}", archive.to_string_lossy()).to_ascii_lowercase()
             }
-            Item::Pdf { doc, inner, name, .. } => {
+            Item::Pdf {
+                doc, inner, name, ..
+            } => {
                 let disk = doc.disk().to_string_lossy();
                 match inner {
                     Some(entry) => format!("{disk}/{entry}/{name}"),
@@ -211,7 +223,10 @@ pub fn scan_archive(path: &Path, is_media: impl Fn(&Path) -> bool) -> Vec<Item> 
     for name in names {
         let p = Path::new(&name);
         if is_media(p) {
-            items.push(Item::Archived { archive: archive.clone(), entry: name });
+            items.push(Item::Archived {
+                archive: archive.clone(),
+                entry: name,
+            });
         } else if crate::pdf::is_pdf_file(p)
             && let Some(bytes) = read_named(&mut zip, &name)
         {
@@ -231,10 +246,15 @@ fn read_named(zip: &mut zip::ZipArchive<BufReader<std::fs::File>>, name: &str) -
 /// macOS zips are littered with `__MACOSX/` resource forks and `._*`/`.DS_Store`
 /// dotfiles; none of them are viewable media even when the extension says so.
 fn is_junk(name: &str) -> bool {
-    name.split('/').any(|part| part.starts_with('.') || part == "__MACOSX")
+    name.split('/')
+        .any(|part| part.starts_with('.') || part == "__MACOSX")
 }
 
-fn read_chunked(mut r: impl Read, size_hint: usize, cancelled: &dyn Fn() -> bool) -> Option<Vec<u8>> {
+fn read_chunked(
+    mut r: impl Read,
+    size_hint: usize,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<Vec<u8>> {
     let mut data = Vec::with_capacity(size_hint);
     let mut buf = vec![0u8; READ_CHUNK];
     loop {

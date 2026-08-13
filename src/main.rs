@@ -5,8 +5,8 @@ use std::cmp::Ordering as CmpOrd;
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -44,6 +44,18 @@ const MAX_DECODE_RETRIES: usize = 3;
 const EXPAND_AHEAD: usize = 3;
 const EXPAND_BEHIND: usize = 1;
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "gif", "tiff"];
+/// eframe Storage key for the saved playback-panel position.
+const PANEL_POS_KEY: &str = "playback_panel_pos";
+
+/// IINA persists the floating OSC using normalized coordinates: the horizontal
+/// centre as a fraction of the video width and the bottom edge as a fraction of
+/// the video height. Keeping the same representation makes resize/restoration
+/// behavior match IINA instead of pinning the panel to old absolute pixels.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+struct PanelPosition {
+    horizontal: f32,
+    vertical: f32,
+}
 
 /// A fixed-size pool of worker threads pulling jobs off a shared channel. This
 /// is all we needed from rayon: drop that dependency (and its crossbeam-deque /
@@ -70,7 +82,10 @@ impl ThreadPool {
                     .unwrap()
             })
             .collect();
-        Self { tx: Some(tx), workers }
+        Self {
+            tx: Some(tx),
+            workers,
+        }
     }
 
     fn spawn<F: FnOnce() + Send + 'static>(&self, job: F) {
@@ -103,6 +118,107 @@ struct SharedState {
     /// Set when a newer pipeline supersedes this one, so its coordinator (which
     /// otherwise loops forever) exits instead of spinning on a stale list.
     cancelled: AtomicBool,
+    /// Commands pushed by the native AppKit panel since the last frame, applied
+    /// to the player during the next egui frame.
+    #[cfg(target_os = "macos")]
+    native_cmds: Mutex<Vec<NativeCmd>>,
+    /// Pending native panel move using IINA's normalized OSC coordinates, set
+    /// by the drag callback and applied to `playback_panel_pos` next frame.
+    #[cfg(target_os = "macos")]
+    native_panel_move: Mutex<Option<(f64, f64)>>,
+}
+
+/// A command pushed by the native AppKit panel (IINA's OSC) and applied to the
+/// player on the next egui frame. The panel's target/action callbacks can't
+/// reach `&mut KagamiApp`, so they enqueue these instead.
+#[derive(Debug, Clone, Copy)]
+enum NativeCmd {
+    Seek(f64),
+    Volume(f32),
+    Play,
+    SeekBack,
+    SeekForward,
+    Mute,
+    Fullscreen,
+    SaveFrame,
+    AudioTrack(i32),
+}
+
+#[cfg(target_os = "macos")]
+fn push_native_cmd(queue: &mut Vec<NativeCmd>, cmd: NativeCmd) {
+    match (queue.last_mut(), cmd) {
+        // Native sliders are continuous controls. If several absolute updates
+        // arrive before egui gets a frame, only the newest value matters; keep
+        // relative/toggle commands ordered around them.
+        (Some(NativeCmd::Seek(current)), NativeCmd::Seek(next)) => *current = next,
+        (Some(NativeCmd::Volume(current)), NativeCmd::Volume(next)) => *current = next,
+        (_, cmd) => queue.push(cmd),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn native_controls_callbacks(
+    shared: &Arc<SharedState>,
+    ctx: &egui::Context,
+) -> controls::ControlsCallbacks {
+    let cmd = |cmd: NativeCmd| {
+        let shared = Arc::clone(shared);
+        let repaint = ctx.clone();
+        Box::new(move || {
+            push_native_cmd(&mut shared.native_cmds.lock().unwrap(), cmd);
+            repaint.request_repaint();
+        }) as Box<dyn Fn()>
+    };
+
+    controls::ControlsCallbacks {
+        on_seek: {
+            let shared = Arc::clone(shared);
+            let repaint = ctx.clone();
+            Box::new(move |fraction| {
+                push_native_cmd(
+                    &mut shared.native_cmds.lock().unwrap(),
+                    NativeCmd::Seek(fraction),
+                );
+                repaint.request_repaint();
+            })
+        },
+        on_volume: {
+            let shared = Arc::clone(shared);
+            let repaint = ctx.clone();
+            Box::new(move |volume| {
+                push_native_cmd(
+                    &mut shared.native_cmds.lock().unwrap(),
+                    NativeCmd::Volume(volume),
+                );
+                repaint.request_repaint();
+            })
+        },
+        on_play: cmd(NativeCmd::Play),
+        on_seek_back: cmd(NativeCmd::SeekBack),
+        on_seek_forward: cmd(NativeCmd::SeekForward),
+        on_mute: cmd(NativeCmd::Mute),
+        on_fullscreen: cmd(NativeCmd::Fullscreen),
+        on_save_frame: cmd(NativeCmd::SaveFrame),
+        on_audio_track: {
+            let shared = Arc::clone(shared);
+            let repaint = ctx.clone();
+            Box::new(move |track| {
+                push_native_cmd(
+                    &mut shared.native_cmds.lock().unwrap(),
+                    NativeCmd::AudioTrack(track),
+                );
+                repaint.request_repaint();
+            })
+        },
+        on_move: {
+            let shared = Arc::clone(shared);
+            let repaint = ctx.clone();
+            Box::new(move |x, y| {
+                *shared.native_panel_move.lock().unwrap() = Some((x, y));
+                repaint.request_repaint();
+            })
+        },
+    }
 }
 
 /// Natural-order comparison: runs of digits compare by numeric value, so
@@ -163,7 +279,10 @@ fn is_image_file(path: &Path) -> bool {
 }
 
 fn video_key(item: &Item) -> (PathBuf, PathBuf) {
-    (item.disk_path().to_path_buf(), item.media_name().to_path_buf())
+    (
+        item.disk_path().to_path_buf(),
+        item.media_name().to_path_buf(),
+    )
 }
 
 fn is_media_name(path: &Path) -> bool {
@@ -172,8 +291,7 @@ fn is_media_name(path: &Path) -> bool {
 
 /// Sort in natural order (1, 2, ... 9, 10) rather than lexically (1, 10, 2).
 fn sort_natural(items: Vec<Item>) -> Vec<Item> {
-    let mut keyed: Vec<(String, Item)> =
-        items.into_iter().map(|it| (it.sort_key(), it)).collect();
+    let mut keyed: Vec<(String, Item)> = items.into_iter().map(|it| (it.sort_key(), it)).collect();
     keyed.sort_by(|a, b| natural_cmp(&a.0, &b.0));
     keyed.into_iter().map(|(_, it)| it).collect()
 }
@@ -243,7 +361,10 @@ struct ExpandResult {
 fn run_scan(opened: Vec<PathBuf>, tx: Sender<ScanResult>, ctx: egui::Context) {
     let root = match opened.as_slice() {
         [] => {
-            let _ = tx.send(ScanResult { root: PathBuf::new(), items: Vec::new() });
+            let _ = tx.send(ScanResult {
+                root: PathBuf::new(),
+                items: Vec::new(),
+            });
             return;
         }
         [p] if p.is_dir() => p.clone(),
@@ -265,7 +386,10 @@ fn run_scan(opened: Vec<PathBuf>, tx: Sender<ScanResult>, ctx: egui::Context) {
         items.push(Item::Container { path: Arc::new(c) });
     }
 
-    let _ = tx.send(ScanResult { root, items: sort_natural(items) });
+    let _ = tx.send(ScanResult {
+        root,
+        items: sort_natural(items),
+    });
     ctx.request_repaint();
 }
 
@@ -330,12 +454,7 @@ fn hydrate_file(path: &Path, idx: usize, shared: &SharedState, max_dist: usize) 
 /// Downscale so neither side exceeds `max_side`, preserving aspect ratio. Caps
 /// both the GPU texture limit and our display budget, and keeps decode/upload
 /// cheap for huge source images.
-fn downscale_to_limit(
-    w: u32,
-    h: u32,
-    rgba: Vec<u8>,
-    max_side: u32,
-) -> Result<(u32, u32, Vec<u8>)> {
+fn downscale_to_limit(w: u32, h: u32, rgba: Vec<u8>, max_side: u32) -> Result<(u32, u32, Vec<u8>)> {
     if w <= max_side && h <= max_side {
         return Ok((w, h, rgba));
     }
@@ -374,7 +493,11 @@ fn decode_from_bytes(data: &[u8], max_side: u32) -> Result<Decoded> {
     let rgba = reader.decode()?.into_rgba8();
     let (w, h) = (rgba.width(), rgba.height());
     let (w, h, pixels) = downscale_to_limit(w, h, rgba.into_raw(), max_side)?;
-    Ok(Decoded { width: w, height: h, frames: vec![(pixels, 0.0)] })
+    Ok(Decoded {
+        width: w,
+        height: h,
+        frames: vec![(pixels, 0.0)],
+    })
 }
 
 /// Turn a PDF page's extracted image into a decoded frame, capping the longest
@@ -382,9 +505,17 @@ fn decode_from_bytes(data: &[u8], max_side: u32) -> Result<Decoded> {
 /// ready RGBA; an embedded JPEG still goes through the decoder.
 fn pdf_decoded(img: PdfImage, max_side: u32) -> Option<Decoded> {
     match img {
-        PdfImage::Rgba { width, height, data } => {
+        PdfImage::Rgba {
+            width,
+            height,
+            data,
+        } => {
             let (w, h, pixels) = downscale_to_limit(width, height, data, max_side).ok()?;
-            Some(Decoded { width: w, height: h, frames: vec![(pixels, 0.0)] })
+            Some(Decoded {
+                width: w,
+                height: h,
+                frames: vec![(pixels, 0.0)],
+            })
         }
         PdfImage::Encoded(bytes) => decode_from_bytes(&bytes, max_side).ok(),
     }
@@ -430,7 +561,11 @@ fn decode_gif(data: &[u8], max_side: u32) -> Result<Decoded> {
     for (i, frame) in decoder.into_frames().enumerate() {
         let frame = frame?;
         let (numer, denom) = frame.delay().numer_denom_ms();
-        let ms = if denom == 0 { 100.0 } else { numer as f32 / denom as f32 };
+        let ms = if denom == 0 {
+            100.0
+        } else {
+            numer as f32 / denom as f32
+        };
         let ms = if ms < 10.0 { 100.0 } else { ms };
         if !(i as u64).is_multiple_of(step) {
             // Dropped by decimation: its screen time stays on the kept frame.
@@ -451,7 +586,11 @@ fn decode_gif(data: &[u8], max_side: u32) -> Result<Decoded> {
     if frames.is_empty() {
         anyhow::bail!("GIF has no frames");
     }
-    Ok(Decoded { width: dims.0, height: dims.1, frames })
+    Ok(Decoded {
+        width: dims.0,
+        height: dims.1,
+        frames,
+    })
 }
 
 fn spawn_hydrate(
@@ -800,7 +939,11 @@ fn draw_video_overlay(
     fill.set_right(bar.left() + bar.width() * frac);
     painter.rect_filled(fill, 2.5, egui::Color32::from_rgb(240, 240, 240));
     let knob = if scrubbing { 8.0 } else { 6.0 };
-    painter.circle_filled(egui::pos2(fill.right(), bar.center().y), knob, egui::Color32::WHITE);
+    painter.circle_filled(
+        egui::pos2(fill.right(), bar.center().y),
+        knob,
+        egui::Color32::WHITE,
+    );
 
     let vol = if info.muted || info.volume <= 0.0 {
         "muted".to_string()
@@ -909,12 +1052,9 @@ struct KagamiApp {
     /// egui time until which the video controls stay visible; bumped on pointer
     /// movement or a control key so they fade out only while idle during play.
     controls_until: f64,
-    /// While scrubbing the seek bar, the last dragged-to time; applied as one
-    /// precise seek when the drag ends.
-    scrub_target: Option<f64>,
-    /// egui time of the last scrub seek actually sent to the player, so live
-    /// scrubbing is rate-limited instead of backlogging seeks behind the cursor.
-    last_scrub_t: f64,
+    /// IINA-style normalized floating-OSC position. `None` uses IINA's defaults
+    /// (horizontal 0.5, vertical 0.1).
+    playback_panel_pos: Option<PanelPosition>,
     /// Native fullscreen state we track ourselves (eframe's viewport flag is
     /// often `None`, which made the toggle misfire).
     fullscreen: bool,
@@ -962,6 +1102,10 @@ impl KagamiApp {
                 current_idx: AtomicUsize::new(0),
                 image_count: AtomicUsize::new(0),
                 cancelled: AtomicBool::new(false),
+                #[cfg(target_os = "macos")]
+                native_cmds: Mutex::new(Vec::new()),
+                #[cfg(target_os = "macos")]
+                native_panel_move: Mutex::new(None),
             }),
             last_title_index: None,
             max_side,
@@ -974,8 +1118,7 @@ impl KagamiApp {
             #[cfg(target_os = "macos")]
             native_controls: None,
             controls_until: 0.0,
-            scrub_target: None,
-            last_scrub_t: 0.0,
+            playback_panel_pos: cc.storage.and_then(|s| eframe::get_value(s, PANEL_POS_KEY)),
             fullscreen: false,
             deleted: HashSet::new(),
             egui_ctx: cc.egui_ctx.clone(),
@@ -1055,6 +1198,10 @@ impl KagamiApp {
             current_idx: AtomicUsize::new(current_index),
             image_count: AtomicUsize::new(items.len()),
             cancelled: AtomicBool::new(false),
+            #[cfg(target_os = "macos")]
+            native_cmds: Mutex::new(Vec::new()),
+            #[cfg(target_os = "macos")]
+            native_panel_move: Mutex::new(None),
         });
         let (decoded_tx, decoded_rx) = crossbeam_channel::unbounded();
         let items_arc = items.clone();
@@ -1066,6 +1213,10 @@ impl KagamiApp {
         self.items = items;
         self.current_index = current_index;
         self.shared = shared;
+        #[cfg(target_os = "macos")]
+        if let Some(controls) = &self.native_controls {
+            controls.set_callbacks(native_controls_callbacks(&self.shared, &self.egui_ctx));
+        }
         self.decoded_rx = decoded_rx;
     }
 
@@ -1127,11 +1278,14 @@ impl KagamiApp {
             key_to_new.entry(it.sort_key()).or_insert(i);
         }
         let remap = |old_idx: usize| -> Option<usize> {
-            old.get(old_idx).and_then(|it| key_to_new.get(&it.sort_key()).copied())
+            old.get(old_idx)
+                .and_then(|it| key_to_new.get(&it.sort_key()).copied())
         };
 
         let current_index = if on_placeholder {
-            next.iter().position(|it| it.disk_path() == cpath).unwrap_or(0)
+            next.iter()
+                .position(|it| it.disk_path() == cpath)
+                .unwrap_or(0)
         } else {
             remap(self.current_index).unwrap_or(0)
         };
@@ -1147,7 +1301,10 @@ impl KagamiApp {
         }
         self.cache = new_cache;
         self.deleted = self.deleted.iter().filter_map(|&i| remap(i)).collect();
-        self.video = self.video.take().and_then(|(idx, p)| remap(idx).map(|n| (n, p)));
+        self.video = self
+            .video
+            .take()
+            .and_then(|(idx, p)| remap(idx).map(|n| (n, p)));
         self.last_title_index = None;
 
         self.start_coordinator(Arc::new(next), current_index);
@@ -1162,7 +1319,11 @@ impl KagamiApp {
         }
         let mut i = start;
         for _ in 0..n {
-            i = if dir > 0 { (i + 1) % n } else { (i + n - 1) % n };
+            i = if dir > 0 {
+                (i + 1) % n
+            } else {
+                (i + n - 1) % n
+            };
             if !self.deleted.contains(&i) {
                 return Some(i);
             }
@@ -1282,7 +1443,11 @@ impl KagamiApp {
         }
 
         // Pan by dragging or scrolling, but only when zoomed past fit.
-        let resp = ui.interact(rect, ui.id().with("image_pan"), egui::Sense::click_and_drag());
+        let resp = ui.interact(
+            rect,
+            ui.id().with("image_pan"),
+            egui::Sense::click_and_drag(),
+        );
         if self.zoom > 1.0 {
             self.pan += resp.drag_delta() + scroll;
             ui.ctx().set_cursor_icon(if resp.dragged() {
@@ -1300,7 +1465,11 @@ impl KagamiApp {
         let scaled = img_size * (fit * self.zoom);
         let clamp = |img: f32, view: f32, p: f32| {
             let slack = (img - view) / 2.0;
-            if slack > 0.0 { p.clamp(-slack, slack) } else { 0.0 }
+            if slack > 0.0 {
+                p.clamp(-slack, slack)
+            } else {
+                0.0
+            }
         };
         self.pan.x = clamp(scaled.x, rect.width(), self.pan.x);
         self.pan.y = clamp(scaled.y, rect.height(), self.pan.y);
@@ -1393,6 +1562,21 @@ impl KagamiApp {
                 Err(e) => self.video_error = Some(format!("Cannot play video: {e}")),
             }
         }
+    }
+
+    /// Drain pending native-panel commands (for the caller to apply to the
+    /// player) and fold a pending panel move into `playback_panel_pos`. Reads
+    /// from the shared `Arc` so it doesn't conflict with the live `&mut player`.
+    #[cfg(target_os = "macos")]
+    fn drain_native(&mut self) -> Vec<NativeCmd> {
+        let cmds = std::mem::take(&mut *self.shared.native_cmds.lock().unwrap());
+        if let Some((horizontal, vertical)) = self.shared.native_panel_move.lock().unwrap().take() {
+            self.playback_panel_pos = Some(PanelPosition {
+                horizontal: horizontal as f32,
+                vertical: vertical as f32,
+            });
+        }
+        cmds
     }
 
     fn prune_cache(&mut self) {
@@ -1625,7 +1809,46 @@ impl eframe::App for KagamiApp {
                     }
 
                     let mut dbl_fullscreen = false;
+                    // Pull any commands the native panel pushed since last frame.
+                    // Apply them before snapshotting state for the panel below:
+                    // otherwise a seek click can be followed by one stale
+                    // `setDoubleValue`, briefly snapping the playhead backwards.
+                    #[cfg(target_os = "macos")]
+                    let native_cmds = self.drain_native();
+                    #[cfg(target_os = "macos")]
+                    if native_cmds
+                        .iter()
+                        .any(|c| matches!(c, NativeCmd::Fullscreen))
+                    {
+                        self.set_fullscreen(&ctx, !self.fullscreen);
+                    }
+
                     if let Some((_, player)) = &mut self.video {
+                        #[cfg(target_os = "macos")]
+                        for c in native_cmds {
+                            match c {
+                                NativeCmd::Seek(f) => player.seek_to_fraction(f),
+                                NativeCmd::Volume(v) => player.set_volume(v),
+                                NativeCmd::Play => player.toggle_pause(),
+                                NativeCmd::SeekBack => player.seek_by(-video::SEEK_STEP),
+                                NativeCmd::SeekForward => player.seek_by(video::SEEK_STEP),
+                                NativeCmd::Mute => player.toggle_mute(),
+                                NativeCmd::Fullscreen => {}
+                                NativeCmd::SaveFrame => {
+                                    if let Some(path) =
+                                        downloads_png_path(self.items[cur].media_name())
+                                    {
+                                        match player.save_snapshot(&path) {
+                                            Ok(()) => {
+                                                eprintln!("saved frame to {}", path.display())
+                                            }
+                                            Err(e) => eprintln!("frame save failed: {e}"),
+                                        }
+                                    }
+                                }
+                                NativeCmd::AudioTrack(track) => player.set_audio_track(track),
+                            }
+                        }
                         if seek_back {
                             player.seek_by(-video::SEEK_STEP);
                         }
@@ -1646,7 +1869,8 @@ impl eframe::App for KagamiApp {
                         }
                         // Save exactly the on-screen frame at full source
                         // resolution (libvlc writes the PNG directly).
-                        if save && let Some(path) = downloads_png_path(self.items[cur].media_name()) {
+                        if save && let Some(path) = downloads_png_path(self.items[cur].media_name())
+                        {
                             match player.save_snapshot(&path) {
                                 Ok(()) => eprintln!("saved frame to {}", path.display()),
                                 Err(e) => eprintln!("frame save failed: {e}"),
@@ -1657,122 +1881,80 @@ impl eframe::App for KagamiApp {
                         // window; egui only drives the controls/input below.
                         player.update(&ctx);
 
+                        #[cfg_attr(target_os = "macos", allow(unused_variables))]
                         let show_controls = player.is_paused() || time < self.controls_until;
 
-                        // One response covers the whole video; we route it by
-                        // position so the seek bar and click-to-pause never fight
-                        // over the pointer (which made the bar unclickable).
-                        let resp =
-                            ui.interact(rect, ui.id().with("video"), egui::Sense::click_and_drag());
-                        let pointer = resp.interact_pointer_pos();
-
-                        // The native control bar is drawn by AppKit but stays
-                        // mouse-transparent, so the seek and volume sliders are
-                        // driven here over the hitboxes it reports (egui points).
+                        // The native IINA-style floating panel: positioned and
+                        // state-pushed here, but input handled by AppKit. Build
+                        // the state only after native commands were applied so a
+                        // seek action is reflected immediately in the slider.
                         #[cfg(target_os = "macos")]
-                        let (seek_rect, volume_rect) = {
+                        {
+                            let position = player.position();
+                            let duration = player.duration();
+                            let paused = player.is_paused();
+                            let muted = player.is_muted();
+                            let volume = player.volume();
+                            let current_audio_track = player.current_audio_track();
+                            let audio_tracks = player.audio_tracks();
+                            let panel_state = controls::VideoState {
+                                position,
+                                duration,
+                                paused,
+                                muted,
+                                volume,
+                                audio_tracks,
+                                current_audio_track,
+                                visible: paused || time < self.controls_until,
+                            };
                             if self.native_controls.is_none()
                                 && let Some(mtm) = objc2::MainThreadMarker::new()
+                                && let Some(c) = controls::NativeControls::new(mtm)
                             {
-                                self.native_controls = controls::NativeControls::new(mtm);
+                                c.set_callbacks(native_controls_callbacks(&self.shared, &ctx));
+                                self.native_controls = Some(c);
                             }
-                            let state = controls::VideoState {
-                                // While scrubbing, show the dragged-to time so the
-                                // knob tracks the cursor even as the frame catches up.
-                                position: self.scrub_target.unwrap_or_else(|| player.position()),
+                            let screen = ui.ctx().content_rect();
+                            let pos = self.playback_panel_pos.map(|p| (p.horizontal, p.vertical));
+                            if let Some(c) = &self.native_controls {
+                                c.update(
+                                    screen.width() as f64,
+                                    screen.height() as f64,
+                                    &panel_state,
+                                    &fmt_time(panel_state.position),
+                                    &fmt_time(panel_state.duration),
+                                    pos,
+                                );
+                            }
+                        }
+
+                        // One response covers the whole video for click-to-pause
+                        // and double-click fullscreen. The panel itself (sliders,
+                        // play button, drag) is fully native AppKit — IINA's OSC —
+                        // so egui no longer drives any of it.
+                        let resp =
+                            ui.interact(rect, ui.id().with("video"), egui::Sense::click_and_drag());
+                        #[cfg_attr(target_os = "macos", allow(unused_variables))]
+                        let pointer = resp.interact_pointer_pos();
+
+                        #[cfg(not(target_os = "macos"))]
+                        if show_controls {
+                            let info = VideoOverlay {
+                                position: player.position(),
                                 duration: player.duration(),
                                 paused: player.is_paused(),
                                 muted: player.is_muted(),
                                 volume: player.volume(),
-                                visible: show_controls,
                             };
-                            let screen = ui.ctx().content_rect();
-                            let to_rect = |hb: &controls::Hit| {
-                                egui::Rect::from_min_size(
-                                    egui::pos2(hb.min_x, hb.min_y),
-                                    egui::vec2(hb.width, hb.height),
-                                )
-                            };
-                            match self.native_controls.as_ref().and_then(|c| {
-                                c.update(
-                                    screen.width() as f64,
-                                    screen.height() as f64,
-                                    &state,
-                                    &fmt_time(state.position),
-                                    &fmt_time(state.duration),
-                                )
-                            }) {
-                                Some(bar) => (Some(to_rect(&bar.seek)), Some(to_rect(&bar.volume))),
-                                None => (None, None),
-                            }
-                        };
-
-                        #[cfg(not(target_os = "macos"))]
-                        let (seek_rect, volume_rect): (Option<egui::Rect>, Option<egui::Rect>) = (
-                            show_controls.then(|| {
-                                let info = VideoOverlay {
-                                    position: player.position(),
-                                    duration: player.duration(),
-                                    paused: player.is_paused(),
-                                    muted: player.is_muted(),
-                                    volume: player.volume(),
-                                };
-                                let scrubbing = resp.dragged()
-                                    && pointer
-                                        .is_some_and(|p| p.y >= rect.bottom() - CONTROLS_STRIP_H);
-                                draw_video_overlay(ui, rect, &info, scrubbing)
-                            }),
-                            None,
-                        );
-
-                        let mut on_bar = false;
-                        if let Some(bar) = seek_rect {
-                            let hit = bar.expand2(egui::vec2(0.0, 16.0));
-                            if player.duration() > 0.0 && let Some(p) = pointer {
-                                let f = ((p.x - bar.left()) / bar.width()).clamp(0.0, 1.0) as f64;
-                                let t = f * player.duration();
-                                if (resp.drag_started() && hit.contains(p))
-                                    || (resp.dragged() && self.scrub_target.is_some())
-                                {
-                                    // Remember the latest target, but rate-limit
-                                    // the seeks so they track decode speed instead
-                                    // of queuing up behind the cursor.
-                                    self.scrub_target = Some(t);
-                                    if time - self.last_scrub_t >= 0.03 {
-                                        player.scrub_to(t);
-                                        self.last_scrub_t = time;
-                                    }
-                                    on_bar = true;
-                                } else if resp.clicked() && hit.contains(p) {
-                                    player.seek_to(t);
-                                    on_bar = true;
-                                }
-                            }
-                            if resp.drag_stopped()
-                                && let Some(t) = self.scrub_target.take()
-                            {
-                                player.seek_to(t);
-                                player.end_scrub();
-                            }
-                        }
-                        if let Some(vbar) = volume_rect {
-                            let hit = vbar.expand2(egui::vec2(0.0, 16.0));
-                            if (resp.clicked() || resp.dragged())
-                                && let Some(p) = pointer
-                                && hit.contains(p)
-                            {
-                                let f = ((p.x - vbar.left()) / vbar.width()).clamp(0.0, 1.0);
-                                player.set_volume(f);
-                                on_bar = true;
-                            }
+                            let scrubbing = resp.dragged()
+                                && pointer.is_some_and(|p| p.y >= rect.bottom() - CONTROLS_STRIP_H);
+                            draw_video_overlay(ui, rect, &info, scrubbing);
                         }
 
                         // Double-click toggles fullscreen (IINA-style); a single
-                        // click off the bar (or Space) toggles play.
+                        // click (or Space) toggles play.
                         dbl_fullscreen = resp.double_clicked();
-                        if (space && !changed)
-                            || (resp.clicked() && !on_bar && !resp.double_clicked())
-                        {
+                        if (space && !changed) || (resp.clicked() && !resp.double_clicked()) {
                             player.toggle_pause();
                         }
                     } else {
@@ -1811,6 +1993,10 @@ impl eframe::App for KagamiApp {
                 }
             });
     }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, PANEL_POS_KEY, &self.playback_panel_pos);
+    }
 }
 
 #[cfg(test)]
@@ -1832,7 +2018,12 @@ mod tests {
         // 17000 > the old 16384 default guard that made big photos fail forever.
         let data = encode_jpeg(17000, 64);
         let d = decode_from_bytes(&data, 4096).expect("should decode");
-        assert!(d.width <= 4096 && d.height <= 4096, "downscaled: {}x{}", d.width, d.height);
+        assert!(
+            d.width <= 4096 && d.height <= 4096,
+            "downscaled: {}x{}",
+            d.width,
+            d.height
+        );
         assert_eq!(d.frames[0].0.len(), (d.width * d.height * 4) as usize);
     }
 
@@ -1847,12 +2038,17 @@ mod tests {
             for c in [0u8, 128, 255] {
                 let img = RgbaImage::from_pixel(8, 8, Rgba([c, 0, 0, 255]));
                 let delay = Delay::from_numer_denom_ms(200, 1);
-                enc.encode_frame(Frame::from_parts(img, 0, 0, delay)).unwrap();
+                enc.encode_frame(Frame::from_parts(img, 0, 0, delay))
+                    .unwrap();
             }
         }
         let d = decode_from_bytes(&data, 4096).expect("gif decodes");
         assert_eq!(d.frames.len(), 3, "all frames kept");
-        assert!(d.frames.iter().all(|(_, delay)| (*delay - 0.2).abs() < 0.02));
+        assert!(
+            d.frames
+                .iter()
+                .all(|(_, delay)| (*delay - 0.2).abs() < 0.02)
+        );
         // The animation clock walks frames by their delays and wraps around.
         let clock = CachedImage {
             frames: Vec::new(),
@@ -1906,9 +2102,15 @@ mod tests {
 
         let items = scan_archive(&path, is_media_name);
         assert_eq!(items.len(), 1, "junk and non-media entries are skipped");
-        assert!(items[0].display(Path::new("/")).ends_with(".cbz/pages/page1.jpg"));
+        assert!(
+            items[0]
+                .display(Path::new("/"))
+                .ends_with(".cbz/pages/page1.jpg")
+        );
 
-        let data = items[0].read(&|| false).expect("entry decompresses to memory");
+        let data = items[0]
+            .read(&|| false)
+            .expect("entry decompresses to memory");
         let d = decode_from_bytes(&data, 4096).expect("entry decodes");
         assert_eq!((d.width, d.height), (64, 32));
         std::fs::remove_file(&path).unwrap();
@@ -1935,7 +2137,11 @@ fn load_icon() -> egui::IconData {
         .expect("bundled icon is a valid PNG")
         .into_rgba8();
     let (width, height) = image.dimensions();
-    egui::IconData { rgba: image.into_raw(), width, height }
+    egui::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    }
 }
 
 /// Bring the app to the foreground. Used after the launch picker and when a
@@ -2019,7 +2225,10 @@ mod open_docs {
     }
     impl AEDesc {
         fn null() -> Self {
-            AEDesc { descriptor_type: 0, data_handle: std::ptr::null_mut() }
+            AEDesc {
+                descriptor_type: 0,
+                data_handle: std::ptr::null_mut(),
+            }
         }
     }
 
@@ -2038,7 +2247,12 @@ mod open_docs {
             refcon: *mut c_void,
             is_sys: u8,
         ) -> i32;
-        fn AEGetParamDesc(event: *const AEDesc, keyword: u32, desired: u32, result: *mut AEDesc) -> i32;
+        fn AEGetParamDesc(
+            event: *const AEDesc,
+            keyword: u32,
+            desired: u32,
+            result: *mut AEDesc,
+        ) -> i32;
         fn AECountItems(list: *const AEDesc, count: *mut isize) -> i32;
         fn AEGetNthDesc(
             list: *const AEDesc,
@@ -2060,7 +2274,11 @@ mod open_docs {
         Some(PathBuf::from(p.to_string()))
     }
 
-    unsafe extern "C" fn handle_open(event: *const AEDesc, _reply: *mut AEDesc, _refcon: *mut c_void) -> i16 {
+    unsafe extern "C" fn handle_open(
+        event: *const AEDesc,
+        _reply: *mut AEDesc,
+        _refcon: *mut c_void,
+    ) -> i16 {
         unsafe {
             let mut list = AEDesc::null();
             if AEGetParamDesc(event, fourcc(b"----"), fourcc(b"list"), &mut list) != 0 {
@@ -2093,7 +2311,13 @@ mod open_docs {
     /// Install the Open-Documents handler. Call once, before the event loop runs.
     pub fn install() {
         unsafe {
-            AEInstallEventHandler(fourcc(b"aevt"), fourcc(b"odoc"), Some(handle_open), std::ptr::null_mut(), 0);
+            AEInstallEventHandler(
+                fourcc(b"aevt"),
+                fourcc(b"odoc"),
+                Some(handle_open),
+                std::ptr::null_mut(),
+                0,
+            );
         }
     }
 
@@ -2112,8 +2336,7 @@ mod open_docs {
             return drain();
         };
         let app = NSApplication::sharedApplication(mtm);
-        let deadline = std::time::Instant::now()
-            + std::time::Duration::from_millis(max_ms);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(max_ms);
         loop {
             let pending = drain();
             if !pending.is_empty() {
