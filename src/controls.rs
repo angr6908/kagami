@@ -367,6 +367,7 @@ define_class!(
                 NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Audio Track"));
             menu.setAutoenablesItems(false);
             let target = self as *const FloatingBar as *mut AnyObject;
+            let mut bottom_item = None;
 
             for track in tracks {
                 let item = unsafe {
@@ -385,17 +386,21 @@ define_class!(
                 });
                 unsafe { item.setTarget(Some(&*target)) };
                 menu.addItem(&item);
+                bottom_item = Some(item);
             }
 
-            // NSMenu positions its top-left corner. Lift that corner by the
-            // menu height and right-align it to make this a deliberate drop-up.
+            // Anchor the menu's bottom row to the button instead of guessing
+            // from `menu.size()`. AppKit lays every preceding row upward from
+            // this item and handles label widths/screen clamping itself. The
+            // one-row offset leaves the bottom row immediately above the icon.
+            let Some(bottom_item) = bottom_item else { return };
             let menu_size = menu.size();
-            let button_size = sender.bounds().size;
+            let row_height = menu_size.height / menu.numberOfItems() as f64;
             menu.popUpMenuPositioningItem_atLocation_inView(
-                None,
+                Some(&bottom_item),
                 NSPoint::new(
-                    button_size.width - menu_size.width,
-                    button_size.height + menu_size.height,
+                    sender.bounds().size.width - menu_size.width,
+                    sender.bounds().size.height + row_height,
                 ),
                 Some(sender),
             );
@@ -1121,11 +1126,6 @@ impl NativeControls {
         // decoder restarts entirely. Volume has no such cost and stays live.
         seek.setContinuous(false);
         volume.setContinuous(true);
-        // IINA's PlaySlider switches itself to `.small` in commonInit(), while
-        // PlayerWindowController explicitly makes only the volume slider mini.
-        seek.setControlSize(NSControlSize::Small);
-        volume.setControlSize(NSControlSize::Mini);
-
         let seek_cell: Retained<PlaySliderCell> = {
             let this = PlaySliderCell::alloc(mtm);
             unsafe { msg_send![this, init] }
@@ -1136,6 +1136,14 @@ impl NativeControls {
         };
         install_cell(&seek, &seek_cell);
         install_cell(&volume, &volume_cell);
+        // Apply control sizes after replacing the cells. NSSlider forwards
+        // `setControlSize:` to its current cell; doing this before `setCell:`
+        // leaves the replacement VolumeSliderCell at AppKit's regular size,
+        // producing the oversized knob. This matches IINA's construction order:
+        // VolumeSlider installs its cell, then PlayerWindowController makes the
+        // slider `.mini`, retaining AppKit's native mini knob appearance.
+        seek.setControlSize(NSControlSize::Small);
+        volume.setControlSize(NSControlSize::Mini);
 
         osc_content.addSubview(&speaker);
         osc_content.addSubview(&volume);

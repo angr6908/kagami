@@ -90,6 +90,10 @@ fn same_seek_target(a: f64, b: f64) -> bool {
     (a - b).abs() <= SEEK_DUPLICATE_TOLERANCE_SECS
 }
 
+fn effective_mute(user_muted: bool, scrubbing: bool, seek_suppressed: bool) -> bool {
+    user_muted || scrubbing || seek_suppressed
+}
+
 pub fn is_video_file(path: &Path) -> bool {
     crate::archive::has_ext(path, VIDEO_EXTENSIONS)
 }
@@ -166,6 +170,10 @@ pub struct VideoPlayer {
     paused: bool,
     muted: bool,
     volume: f32,
+    /// libvlc can briefly output pre-seek decoder data after a clock jump.
+    /// Keep that implementation detail separate from the user's mute state so
+    /// mute/volume changes made while seeking are restored correctly.
+    seek_audio_suppressed: Cell<bool>,
     /// Audio stream descriptions are immutable for the life of this player.
     /// VLC may not expose them immediately after `play`, so retry an empty
     /// query at a low cadence and cache the first populated list.
@@ -337,6 +345,7 @@ impl VideoPlayer {
             paused: false,
             muted: false,
             volume: 1.0,
+            seek_audio_suppressed: Cell::new(false),
             audio_tracks: Vec::new(),
             next_audio_track_query: Instant::now(),
             scrubbing: false,
@@ -386,6 +395,15 @@ impl VideoPlayer {
         if self.pending_seek.is_some() {
             self.flush_seek(false);
             egui_ctx.request_repaint_after(Duration::from_millis(SEEK_RETRY_MS));
+        }
+        // Poll even while paused: a paused seek otherwise gets only the frame
+        // triggered by the slider callback, leaving its temporary audio mute
+        // active until some unrelated UI event arrives.
+        if self.sent_seek.get().is_some() {
+            self.in_flight_seek_target();
+            if self.sent_seek.get().is_some() {
+                egui_ctx.request_repaint_after(Duration::from_millis(SEEK_RETRY_MS));
+            }
         }
         self.layout();
     }
@@ -468,7 +486,7 @@ impl VideoPlayer {
 
     pub fn toggle_mute(&mut self) {
         self.muted = !self.muted;
-        unsafe { libvlc_audio_set_mute(self.mp, self.muted as c_int) };
+        self.apply_effective_mute();
     }
 
     /// Set volume to `v`, clamped to [0, 1]. A positive volume unmutes,
@@ -477,13 +495,30 @@ impl VideoPlayer {
         self.volume = v.clamp(0.0, 1.0);
         if self.volume > 0.0 {
             self.muted = false;
-            unsafe { libvlc_audio_set_mute(self.mp, 0) };
         }
         unsafe { libvlc_audio_set_volume(self.mp, (self.volume * 100.0) as c_int) };
+        self.apply_effective_mute();
     }
 
     pub fn volume(&self) -> f32 {
         self.volume
+    }
+
+    fn apply_effective_mute(&self) {
+        let muted = effective_mute(self.muted, self.scrubbing, self.seek_audio_suppressed.get());
+        unsafe { libvlc_audio_set_mute(self.mp, muted as c_int) };
+    }
+
+    fn suppress_seek_audio(&self) {
+        if !self.seek_audio_suppressed.replace(true) {
+            self.apply_effective_mute();
+        }
+    }
+
+    fn restore_seek_audio(&self) {
+        if self.seek_audio_suppressed.replace(false) {
+            self.apply_effective_mute();
+        }
     }
 
     /// Audio streams currently known to VLC. Cache the first populated list;
@@ -616,6 +651,10 @@ impl VideoPlayer {
             at: now,
         }));
         self.last_dispatched_seek.set(Some((target, now)));
+        // Silence libvlc before restarting the demuxer/decoder. Without this,
+        // a short packet from the old playback position can escape before the
+        // audio clock catches up, heard as a click or repeated syllable.
+        self.suppress_seek_audio();
         unsafe {
             if let Some(fraction) = fraction {
                 libvlc_media_player_set_position(self.mp, fraction);
@@ -633,6 +672,9 @@ impl VideoPlayer {
         let elapsed = sent.at.elapsed();
         if elapsed >= Duration::from_millis(SEEK_ACK_MAX_MS) {
             self.sent_seek.set(None);
+            if self.pending_seek.is_none() {
+                self.restore_seek_audio();
+            }
             return None;
         }
 
@@ -646,6 +688,12 @@ impl VideoPlayer {
                 self.paused,
             ) {
                 self.sent_seek.set(None);
+                // A newer throttled request may still be waiting. Keep output
+                // muted across that handoff so no old-position packet escapes
+                // during the one-frame gap before it is dispatched.
+                if self.pending_seek.is_none() {
+                    self.restore_seek_audio();
+                }
                 return None;
             }
         }
@@ -660,7 +708,7 @@ impl VideoPlayer {
     pub fn scrub_to(&mut self, target: f64) {
         if !self.scrubbing {
             self.scrubbing = true;
-            unsafe { libvlc_audio_set_mute(self.mp, 1) };
+            self.apply_effective_mute();
         }
         self.seek_to(target);
     }
@@ -672,7 +720,7 @@ impl VideoPlayer {
         if self.scrubbing {
             self.scrubbing = false;
             self.flush_seek(true);
-            unsafe { libvlc_audio_set_mute(self.mp, self.muted as c_int) };
+            self.apply_effective_mute();
         }
     }
 
@@ -736,6 +784,14 @@ mod seek_tests {
     fn duplicate_slider_targets_within_one_frame_are_equivalent() {
         assert!(same_seek_target(50.0, 50.015));
         assert!(!same_seek_target(50.0, 50.025));
+    }
+
+    #[test]
+    fn internal_audio_suppression_never_overrides_user_mute() {
+        assert!(effective_mute(true, false, false));
+        assert!(effective_mute(false, true, false));
+        assert!(effective_mute(false, false, true));
+        assert!(!effective_mute(false, false, false));
     }
 }
 
