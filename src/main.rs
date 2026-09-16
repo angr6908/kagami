@@ -1169,6 +1169,7 @@ impl KagamiApp {
         self.video_error = None;
         self.video_positions.clear();
         self.last_title_index = None;
+        self.rotation = 0;
         self.reset_zoom();
         self.start_coordinator(Arc::new(Vec::new()), 0);
     }
@@ -1185,6 +1186,7 @@ impl KagamiApp {
         self.video_error = None;
         self.video_positions.clear();
         self.last_title_index = None;
+        self.rotation = 0;
         self.reset_zoom();
         self.start_coordinator(Arc::new(items), 0);
     }
@@ -1372,7 +1374,6 @@ impl KagamiApp {
     fn reset_zoom(&mut self) {
         self.zoom = 1.0;
         self.pan = egui::Vec2::ZERO;
-        self.rotation = 0;
     }
 
     /// Draw the current image, applying zoom (pinch gesture / ctrl-scroll / the
