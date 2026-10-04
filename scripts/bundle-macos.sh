@@ -21,8 +21,8 @@ VLC="${3:-vendor/vlc}"
 mkdir -p "$FW/lib" "$FW/plugins"
 # Keep VLC's layout verbatim, symlinks included (libvlc.dylib -> libvlc.5.dylib),
 # so we don't duplicate the dylibs; -type f below skips the symlinks when signing.
-cp -R "$VLC/lib/." "$FW/lib/"
-cp -R "$VLC/plugins/." "$FW/plugins/"
+ditto "$VLC/lib" "$FW/lib"
+ditto "$VLC/plugins" "$FW/plugins"
 chmod -R u+w "$FW"
 
 # Repoint the binary's libvlc reference to @rpath, and add rpaths so it finds
@@ -43,9 +43,18 @@ otool -l "$BIN" | awk '/LC_RPATH/{f=1} f&&/ path /{print $2; f=0}' | while IFS= 
     esac
 done
 
-# Re-sign (ad-hoc): copying/editing load commands invalidates signatures, and
-# arm64 refuses to load unsigned Mach-O. Plugins are .dylib on macOS.
-find "$FW" -type f -name '*.dylib' -exec codesign --force --sign - {} +
+resigned_plugin=0
+while IFS= read -r -d '' f; do
+    if ! codesign -v "$f" 2>/dev/null; then
+        codesign --force --sign - "$f"
+        if [[ "$f" == "$FW/plugins/"*.dylib ]]; then
+            resigned_plugin=1
+        fi
+    fi
+done < <(find "$FW" -type f -print0)
+if [[ "$resigned_plugin" == 1 ]]; then
+    bash "$(dirname "$0")/vlc-cache-gen.sh" "$FW"
+fi
 codesign --force --sign - "$BIN"
 
 echo "bundled $(find "$FW" -name '*.dylib' | wc -l | tr -d ' ') dylibs into $FW"

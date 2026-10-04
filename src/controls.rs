@@ -9,16 +9,15 @@ use std::cell::{Cell, RefCell};
 
 use block2::RcBlock;
 use objc2::rc::Retained;
-use objc2::runtime::{AnyClass, AnyObject, Bool};
+use objc2::runtime::{AnyObject, Bool};
 use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSAppearance, NSApplication, NSBezelStyle, NSBezierPath, NSButton, NSButtonType, NSColor,
-    NSControlSize, NSControlStateValueOff, NSControlStateValueOn, NSEvent, NSFont,
-    NSFontWeightMedium, NSFontWeightRegular, NSGlassEffectView, NSGraphicsContext,
-    NSHapticFeedbackManager, NSHapticFeedbackPattern, NSHapticFeedbackPerformanceTime,
-    NSHapticFeedbackPerformer, NSImage, NSImageScaling, NSImageSymbolConfiguration, NSImageView,
-    NSMenu, NSMenuItem, NSShadow, NSSlider, NSSliderCell, NSTextAlignment, NSTextField, NSView,
-    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
+    NSAppearance, NSBezelStyle, NSBezierPath, NSButton, NSButtonType, NSColor, NSControlSize,
+    NSControlStateValueOff, NSControlStateValueOn, NSEvent, NSFont, NSFontWeightMedium,
+    NSFontWeightRegular, NSGlassEffectView, NSGraphicsContext, NSHapticFeedbackManager,
+    NSHapticFeedbackPattern, NSHapticFeedbackPerformanceTime, NSHapticFeedbackPerformer, NSImage,
+    NSImageScaling, NSImageSymbolConfiguration, NSImageView, NSMenu, NSMenuItem, NSShadow,
+    NSSlider, NSSliderCell, NSTextAlignment, NSTextField, NSView,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
@@ -128,32 +127,11 @@ define_class!(
     }
 );
 
-// IINA's TranslucentView owns the actual OSC content: on Tahoe the content sits
-// inside NSGlassEffectView.contentView, while older macOS places it inside an
-// NSVisualEffectView. These subclasses keep that hierarchy but make only the
-// backdrop itself transparent to hit testing. Child controls still receive
-// native AppKit events; empty glass/frosted areas fall through to FloatingBar so
+// IINA's TranslucentView owns the actual OSC content: it sits inside
+// NSGlassEffectView.contentView. This subclass keeps that hierarchy but makes
+// only the backdrop itself transparent to hit testing. Child controls still
+// receive native AppKit events; empty glass areas fall through to FloatingBar so
 // the user can drag the OSC exactly as in IINA.
-define_class!(
-    #[unsafe(super(NSVisualEffectView))]
-    #[thread_kind = MainThreadOnly]
-    #[name = "KagamiVisualEffectBackdrop"]
-    struct VisualEffectBackdrop;
-
-    impl VisualEffectBackdrop {
-        #[unsafe(method(hitTest:))]
-        fn hit_test(&self, point: NSPoint) -> *mut NSView {
-            let hit: *mut NSView = unsafe { msg_send![super(self), hitTest: point] };
-            let this = self as *const VisualEffectBackdrop as *mut NSView;
-            if hit == this {
-                core::ptr::null_mut()
-            } else {
-                hit
-            }
-        }
-    }
-);
-
 define_class!(
     #[unsafe(super(NSGlassEffectView))]
     #[thread_kind = MainThreadOnly]
@@ -618,7 +596,7 @@ pub struct NativeControls {
     mtm: MainThreadMarker,
     container: Retained<ControlsOverlay>,
     bar: Retained<FloatingBar>,
-    backdrop: Backdrop,
+    backdrop: Retained<GlassBackdrop>,
     content: Retained<ControlsOverlay>,
     speaker: Retained<VolumeButton>,
     speaker_image: Retained<NSImageView>,
@@ -956,37 +934,10 @@ fn set_iina_toolbar_bezel(button: &NSButton) {
     button.setBezelStyle(NSBezelStyle::RegularSquare);
 }
 
-enum Backdrop {
-    Glass(Retained<GlassBackdrop>),
-    Legacy(Retained<VisualEffectBackdrop>),
-}
-
-impl Backdrop {
-    fn set_frame(&self, frame: NSRect) {
-        match self {
-            Self::Glass(view) => view.setFrame(frame),
-            Self::Legacy(view) => view.setFrame(frame),
-        }
+fn enable_interactive_glass(view: &GlassBackdrop) {
+    unsafe {
+        let _: () = msg_send![view, setEffectIsInteractive: true];
     }
-
-    fn add_to_bar(&self, bar: &FloatingBar) {
-        match self {
-            Self::Glass(view) => bar.addSubview(view),
-            Self::Legacy(view) => bar.addSubview(view),
-        }
-    }
-
-    fn set_content(&self, content: &ControlsOverlay) {
-        match self {
-            // This is the same containment used by IINA's TranslucentView.
-            Self::Glass(view) => view.setContentView(Some(content)),
-            Self::Legacy(view) => view.addSubview(content),
-        }
-    }
-}
-
-fn supports_liquid_glass() -> bool {
-    AnyClass::get(c"NSGlassEffectView").is_some()
 }
 
 fn install_cell(slider: &NSSlider, cell: &NSSliderCell) {
@@ -1004,10 +955,7 @@ pub fn snap_feedback() {
 }
 
 impl NativeControls {
-    pub fn new(mtm: MainThreadMarker) -> Option<Self> {
-        let app = NSApplication::sharedApplication(mtm);
-        let window = app.keyWindow().or_else(|| app.mainWindow())?;
-        let window_content = window.contentView()?;
+    pub fn new(mtm: MainThreadMarker, window_content: &NSView) -> Self {
         let bounds = window_content.bounds();
 
         // A full-window transparent container. Only its bar subview receives
@@ -1023,36 +971,14 @@ impl NativeControls {
             unsafe { msg_send![this, initWithFrame: bounds] }
         };
 
-        // IINA's `TranslucentView`: Liquid Glass with a 12pt radius on macOS 26,
-        // otherwise the legacy popover visual effect clipped to a 6pt radius.
-        let liquid_glass = supports_liquid_glass();
-        let backdrop = if liquid_glass {
-            let v: Retained<GlassBackdrop> = {
-                let this = GlassBackdrop::alloc(mtm);
-                unsafe { msg_send![this, initWithFrame: bounds] }
-            };
-            v.setCornerRadius(12.0);
-            Backdrop::Glass(v)
-        } else {
-            let v: Retained<VisualEffectBackdrop> = {
-                let this = VisualEffectBackdrop::alloc(mtm);
-                unsafe { msg_send![this, initWithFrame: bounds] }
-            };
-            v.setMaterial(NSVisualEffectMaterial::Popover);
-            v.setBlendingMode(NSVisualEffectBlendingMode::WithinWindow);
-            v.setState(NSVisualEffectState::Active);
-            v.setClipsToBounds(true);
-            v.setWantsLayer(true);
-            unsafe {
-                let layer: *mut AnyObject = msg_send![&*v, layer];
-                if !layer.is_null() {
-                    let _: () = msg_send![layer, setCornerRadius: 6.0_f64];
-                    let _: () = msg_send![layer, setMasksToBounds: true];
-                }
-            }
-            Backdrop::Legacy(v)
+        // IINA's `TranslucentView`: interactive Liquid Glass with a 12pt radius.
+        let backdrop: Retained<GlassBackdrop> = {
+            let this = GlassBackdrop::alloc(mtm);
+            unsafe { msg_send![this, initWithFrame: bounds] }
         };
-        backdrop.add_to_bar(&bar);
+        backdrop.setCornerRadius(12.0);
+        enable_interactive_glass(&backdrop);
+        bar.addSubview(&backdrop);
 
         // Keep the controls inside the glass/frosted container, matching
         // TranslucentView's native hierarchy rather than drawing them as sibling
@@ -1061,7 +987,7 @@ impl NativeControls {
             let this = ControlsOverlay::alloc(mtm);
             unsafe { msg_send![this, initWithFrame: bounds] }
         };
-        backdrop.set_content(&osc_content);
+        backdrop.setContentView(Some(&osc_content));
 
         let speaker: Retained<VolumeButton> = {
             let this = VolumeButton::alloc(mtm);
@@ -1162,7 +1088,7 @@ impl NativeControls {
         container.addSubview(&bar);
         window_content.addSubview(&container);
 
-        Some(Self {
+        Self {
             mtm,
             container,
             bar,
@@ -1185,7 +1111,7 @@ impl NativeControls {
             last_paused: Cell::new(None),
             last_muted: Cell::new(None),
             last_volume_level: Cell::new(None),
-        })
+        }
     }
 
     /// Install or replace the callbacks that fire when the native controls are
@@ -1273,7 +1199,7 @@ impl NativeControls {
         self.bar.setFrame(rect(bx, by, bw, BAR_H));
         // Subviews of the bar use the bar's local coordinate system. Keeping
         // window-space bx/by here used to apply the bar's offset twice.
-        self.backdrop.set_frame(rect(0.0, 0.0, bw, BAR_H));
+        self.backdrop.setFrame(rect(0.0, 0.0, bw, BAR_H));
         self.content.setFrame(rect(0.0, 0.0, bw, BAR_H));
 
         // Top transport row. IINA uses a horizontal stack, so the volume group

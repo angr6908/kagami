@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   release:
-    runs-on: macos-latest  # Apple Silicon, so the default target is aarch64-apple-darwin
+    runs-on: xcode-27  # Apple Silicon, so the default target is aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -28,9 +28,10 @@ jobs:
           echo "${sha}  ${dmg}" | shasum -a 256 -c -
           hdiutil attach "$dmg" -nobrowse -mountpoint /Volumes/VLC
           mkdir -p vendor/vlc
-          cp -R /Volumes/VLC/VLC.app/Contents/MacOS/lib vendor/vlc/lib
-          cp -R /Volumes/VLC/VLC.app/Contents/MacOS/plugins vendor/vlc/plugins
+          ditto /Volumes/VLC/VLC.app/Contents/MacOS/lib vendor/vlc/lib
+          ditto /Volumes/VLC/VLC.app/Contents/MacOS/plugins vendor/vlc/plugins
           hdiutil detach /Volumes/VLC
+          bash scripts/vlc-cache-gen.sh vendor/vlc
       - run: cargo build --release
 
       - name: Package Kagami.app  # .app bundle launches without a terminal
@@ -61,7 +62,7 @@ jobs:
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleIconFile</key><string>AppIcon</string>
             <key>CFBundleShortVersionString</key><string>${version}</string>
-            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>LSMinimumSystemVersion</key><string>27.0</string>
             <key>NSHighResolutionCapable</key><true/>
             <key>CFBundleDocumentTypes</key>
             <array>
@@ -90,10 +91,21 @@ jobs:
           </dict></plist>
           PLIST
           codesign --force --sign - "$app"  # ad-hoc sign (required on arm64)
-          # Name the asset after the full tag (e.g. Kagami-v1.0.0.zip); the plist
-          # above still uses the bare number, which CFBundleShortVersionString wants.
-          ditto -c -k --keepParent "$app" "Kagami-${GITHUB_REF_NAME}.zip"
+
+          dmg_root="dmg"
+          mkdir -p "$dmg_root"
+          mv "$app" "$dmg_root/"
+          ln -s /Applications "$dmg_root/Applications"
+          for attempt in 1 2 3; do
+            if diskutil image create from --format ULFO --volumeName Kagami "$dmg_root" "Kagami-${GITHUB_REF_NAME}.dmg"; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              exit 1
+            fi
+            sleep 5
+          done
 
       - uses: softprops/action-gh-release@v3
         with:
-          files: Kagami-*.zip
+          files: Kagami-*.dmg

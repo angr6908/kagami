@@ -8,8 +8,9 @@ use anyhow::{Result, anyhow};
 use eframe::egui;
 use objc2::rc::Retained;
 use objc2::{MainThreadMarker, MainThreadOnly, class, define_class, msg_send};
-use objc2_app_kit::{NSApplication, NSAutoresizingMaskOptions, NSView, NSWindowOrderingMode};
+use objc2_app_kit::{NSAutoresizingMaskOptions, NSView, NSWindowOrderingMode};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::cell::Cell;
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::mem::ManuallyDrop;
@@ -19,6 +20,7 @@ use std::time::{Duration, Instant};
 const VIDEO_EXTENSIONS: &[&str] = &[
     "mp4", "mov", "m4v", "mkv", "webm", "avi", "wmv", "flv", "mpg", "mpeg", "ts", "m2ts", "3gp",
 ];
+pub const SUBTITLE_EXTENSIONS: &[&str] = &["srt", "ass", "ssa", "vtt", "sub", "smi"];
 pub const SEEK_STEP: f64 = 5.0;
 /// Minimum gap between seek commands handed to libvlc. Native slider events can
 /// arrive much faster than the decoder can restart, so keep only the latest
@@ -41,6 +43,48 @@ const SEEK_ACK_TOLERANCE_SECS: f64 = 0.35;
 const SEEK_DUPLICATE_TOLERANCE_SECS: f64 = 0.02;
 const SEEK_DUPLICATE_WINDOW_MS: u64 = 250;
 const AUDIO_TRACK_RETRY_MS: u64 = 500;
+pub const SUBTITLE_SCALE_DEFAULT: i64 = 100;
+const SUBTITLE_SCALE_STEP: i64 = 10;
+const SUBTITLE_SCALE_MIN: i64 = 10;
+const SUBTITLE_SCALE_MAX: i64 = 500;
+const SUBTITLE_RELOAD_DEBOUNCE_MS: u64 = 350;
+const VLC_VAR_INTEGER: c_int = 0x0030;
+const VLC_VAR_DOINHERIT: c_int = 0x8000;
+const SUB_TEXT_SCALE: &CStr = c"sub-text-scale";
+
+pub fn step_subtitle_scale(scale: i64, steps: i64) -> i64 {
+    (scale + steps * SUBTITLE_SCALE_STEP).clamp(SUBTITLE_SCALE_MIN, SUBTITLE_SCALE_MAX)
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+union VlcValue {
+    i_int: i64,
+}
+
+type VarCreateFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int) -> c_int;
+type VarSetFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int, VlcValue) -> c_int;
+
+struct VarApi {
+    create: VarCreateFn,
+    set: VarSetFn,
+}
+
+fn var_api() -> Option<&'static VarApi> {
+    static API: std::sync::OnceLock<Option<VarApi>> = std::sync::OnceLock::new();
+    API.get_or_init(|| unsafe {
+        let create = dlsym(RTLD_DEFAULT, c"var_Create".as_ptr());
+        let set = dlsym(RTLD_DEFAULT, c"var_SetChecked".as_ptr());
+        if create.is_null() || set.is_null() {
+            return None;
+        }
+        Some(VarApi {
+            create: std::mem::transmute::<*mut c_void, VarCreateFn>(create),
+            set: std::mem::transmute::<*mut c_void, VarSetFn>(set),
+        })
+    })
+    .as_ref()
+}
 
 #[derive(Clone, Copy)]
 struct SentSeek {
@@ -98,6 +142,28 @@ pub fn is_video_file(path: &Path) -> bool {
     crate::archive::has_ext(path, VIDEO_EXTENSIONS)
 }
 
+pub fn is_subtitle_file(path: &Path) -> bool {
+    crate::archive::has_ext(path, SUBTITLE_EXTENSIONS)
+}
+
+static INSTANCE: std::sync::OnceLock<Instance> = std::sync::OnceLock::new();
+
+fn init_instance() {
+    INSTANCE.get_or_init(|| {
+        ensure_plugin_path();
+        let args = [
+            CString::new("--no-video-title-show").unwrap(),
+            CString::new("--quiet").unwrap(),
+        ];
+        let argv: Vec<*const c_char> = args.iter().map(|a| a.as_ptr()).collect();
+        Instance(unsafe { libvlc_new(argv.len() as c_int, argv.as_ptr()) })
+    });
+}
+
+pub fn libvlc_ready() -> bool {
+    INSTANCE.get().is_some()
+}
+
 /// The libvlc core, shareable across threads (libvlc is thread-safe).
 struct Instance(*mut libvlc_instance_t);
 unsafe impl Send for Instance {}
@@ -109,14 +175,26 @@ unsafe impl Sync for Instance {}
 /// environment.
 pub fn preload() {
     ensure_plugin_path();
-    std::thread::spawn(|| {
-        let _ = VideoPlayer::shared_instance();
-    });
+    std::thread::spawn(init_instance);
+}
+
+pub struct VideoHost(Retained<NSView>);
+
+impl VideoHost {
+    pub fn from_window(window: &impl HasWindowHandle) -> Option<Self> {
+        let RawWindowHandle::AppKit(handle) = window.window_handle().ok()?.as_raw() else {
+            return None;
+        };
+        let view = unsafe { Retained::retain(handle.ns_view.as_ptr().cast::<NSView>()) }?;
+        Some(Self(view))
+    }
+
+    pub fn view(&self) -> &NSView {
+        &self.0
+    }
 }
 
 define_class!(
-    // A layer-backed, mouse-transparent host for libvlc's vout. Returning nil from
-    // `hitTest:` lets clicks fall through to the egui layer (play/seek/fullscreen).
     #[unsafe(super(NSView))]
     #[thread_kind = MainThreadOnly]
     #[name = "KagamiVideoView"]
@@ -125,7 +203,7 @@ define_class!(
     impl VideoView {
         #[unsafe(method(hitTest:))]
         fn hit_test(&self, _point: NSPoint) -> *mut NSView {
-            core::ptr::null_mut()
+            std::ptr::null_mut()
         }
     }
 );
@@ -202,6 +280,12 @@ pub struct VideoPlayer {
     /// Position to restore once libvlc's input is live — a `set_time` issued
     /// right after `play` lands before the input thread exists and is dropped.
     resume_at: Option<f64>,
+    pending_subtitle: Option<PathBuf>,
+    hidden_subtitle: Option<i32>,
+    subtitle_file: Option<PathBuf>,
+    subtitle_scale: i64,
+    loaded_subtitle_scale: i64,
+    subtitle_reload_at: Option<Instant>,
     /// View rotation in clockwise quarter-turns (0..4): R turns right, E turns
     /// left, T resets.
     rotation: u8,
@@ -210,7 +294,7 @@ pub struct VideoPlayer {
 }
 
 impl VideoPlayer {
-    pub fn open(path: &Path) -> Result<Self> {
+    pub fn open(path: &Path, host: &VideoHost) -> Result<Self> {
         let mtm =
             MainThreadMarker::new().ok_or_else(|| anyhow!("video must open on main thread"))?;
         let cpath = CString::new(path.to_string_lossy().into_owned())
@@ -220,30 +304,33 @@ impl VideoPlayer {
         if media.is_null() {
             return Err(anyhow!("libvlc_media_new_path failed"));
         }
-        Self::start(mtm, media, std::ptr::null_mut())
+        Self::start(mtm, media, std::ptr::null_mut(), host)
     }
 
     /// Play a video held entirely in memory (a decompressed archive entry).
     /// The buffer is served to libvlc through the `src_*` read/seek callbacks,
     /// so nothing is extracted to disk.
-    pub fn open_bytes(data: Vec<u8>) -> Result<Self> {
-        Self::open_stream(StreamSrc::Mem { data, pos: 0 })
+    pub fn open_bytes(data: Vec<u8>, host: &VideoHost) -> Result<Self> {
+        Self::open_stream(StreamSrc::Mem { data, pos: 0 }, host)
     }
 
     /// Play `len` bytes of `path` starting at `start` — a stored
     /// (uncompressed) archive entry, pread straight out of the archive file.
     /// No decompression, no buffer, no temp file.
-    pub fn open_range(path: &Path, start: u64, len: u64) -> Result<Self> {
+    pub fn open_range(path: &Path, start: u64, len: u64, host: &VideoHost) -> Result<Self> {
         let file = std::fs::File::open(path)?;
-        Self::open_stream(StreamSrc::File {
-            file,
-            start,
-            len,
-            pos: 0,
-        })
+        Self::open_stream(
+            StreamSrc::File {
+                file,
+                start,
+                len,
+                pos: 0,
+            },
+            host,
+        )
     }
 
-    fn open_stream(src: StreamSrc) -> Result<Self> {
+    fn open_stream(src: StreamSrc, host: &VideoHost) -> Result<Self> {
         let mtm =
             MainThreadMarker::new().ok_or_else(|| anyhow!("video must open on main thread"))?;
         let instance = Self::shared_instance()?;
@@ -262,25 +349,13 @@ impl VideoPlayer {
             unsafe { drop(Box::from_raw(src)) };
             return Err(anyhow!("libvlc_media_new_callbacks failed"));
         }
-        Self::start(mtm, media, src)
+        Self::start(mtm, media, src, host)
     }
 
-    /// One libvlc core shared by every player. `libvlc_new` loads the whole
-    /// plugin bank — a multi-second scan — so it happens exactly once for the
-    /// process life, kicked off early by `preload` so the cost overlaps app
-    /// startup instead of stalling the first video open.
     fn shared_instance() -> Result<*mut libvlc_instance_t> {
-        static INSTANCE: std::sync::OnceLock<Instance> = std::sync::OnceLock::new();
         let instance = INSTANCE
-            .get_or_init(|| {
-                ensure_plugin_path();
-                let args = [
-                    CString::new("--no-video-title-show").unwrap(),
-                    CString::new("--quiet").unwrap(),
-                ];
-                let argv: Vec<*const c_char> = args.iter().map(|a| a.as_ptr()).collect();
-                Instance(unsafe { libvlc_new(argv.len() as c_int, argv.as_ptr()) })
-            })
+            .get()
+            .ok_or_else(|| anyhow!("libvlc is still loading"))?
             .0;
         if instance.is_null() {
             return Err(anyhow!("libvlc_new failed (is VLC installed?)"));
@@ -294,6 +369,7 @@ impl VideoPlayer {
         mtm: MainThreadMarker,
         media: *mut libvlc_media_t,
         src: *mut StreamSrc,
+        host: &VideoHost,
     ) -> Result<Self> {
         let release_all = |mp: *mut libvlc_media_player_t| unsafe {
             if !mp.is_null() {
@@ -320,16 +396,19 @@ impl VideoPlayer {
             release_all(std::ptr::null_mut());
             return Err(anyhow!("libvlc_media_player_new_from_media failed"));
         }
+        if let Some(api) = var_api() {
+            unsafe {
+                (api.create)(
+                    mp.cast(),
+                    SUB_TEXT_SCALE.as_ptr(),
+                    VLC_VAR_INTEGER | VLC_VAR_DOINHERIT,
+                )
+            };
+        }
 
         // Build the native render view and slot it behind the AppKit control bar
         // but above the wgpu layer, sized to (and auto-resizing with) the window.
-        let view = match Self::make_view(mtm) {
-            Some(v) => v,
-            None => {
-                release_all(mp);
-                return Err(anyhow!("no window to attach the video view to"));
-            }
-        };
+        let view = Self::make_view(mtm, host.view());
         unsafe { libvlc_media_player_set_nsobject(mp, Retained::as_ptr(&view) as *mut c_void) };
 
         if unsafe { libvlc_media_player_play(mp) } != 0 {
@@ -354,15 +433,18 @@ impl VideoPlayer {
             sent_seek: Cell::new(None),
             last_dispatched_seek: Cell::new(None),
             resume_at: None,
+            pending_subtitle: None,
+            hidden_subtitle: None,
+            subtitle_file: None,
+            subtitle_scale: SUBTITLE_SCALE_DEFAULT,
+            loaded_subtitle_scale: SUBTITLE_SCALE_DEFAULT,
+            subtitle_reload_at: None,
             rotation: 0,
             last_layout: None,
         })
     }
 
-    fn make_view(mtm: MainThreadMarker) -> Option<Retained<VideoView>> {
-        let app = NSApplication::sharedApplication(mtm);
-        let window = app.keyWindow().or_else(|| app.mainWindow())?;
-        let content = window.contentView()?;
+    fn make_view(mtm: MainThreadMarker, content: &NSView) -> Retained<VideoView> {
         let bounds = content.bounds();
         let view: Retained<VideoView> = {
             let this = VideoView::alloc(mtm);
@@ -376,7 +458,7 @@ impl VideoPlayer {
         // Positioned `Below` (relative to nil) puts it at the back of the subview
         // list, so the control bar added later stays on top of the video.
         content.addSubview_positioned_relativeTo(&view, NSWindowOrderingMode::Below, None);
-        Some(view)
+        view
     }
 
     /// Keep the UI loop ticking while playing so the seek bar / clock advance —
@@ -389,6 +471,12 @@ impl VideoPlayer {
             if unsafe { libvlc_media_player_get_time(self.mp) } >= 0 {
                 self.resume_at = None;
                 self.seek_to(t);
+            }
+            egui_ctx.request_repaint_after(Duration::from_millis(50));
+        }
+        if self.pending_subtitle.is_some() {
+            if unsafe { libvlc_media_player_get_time(self.mp) } >= 0 {
+                self.apply_subtitle();
             }
             egui_ctx.request_repaint_after(Duration::from_millis(50));
         }
@@ -405,7 +493,119 @@ impl VideoPlayer {
                 egui_ctx.request_repaint_after(Duration::from_millis(SEEK_RETRY_MS));
             }
         }
+        if let Some(at) = self.subtitle_reload_at {
+            let now = Instant::now();
+            if now >= at {
+                self.subtitle_reload_at = None;
+                if unsafe { libvlc_video_get_spu(self.mp) } != -1 {
+                    self.reload_subtitle();
+                }
+            } else {
+                egui_ctx.request_repaint_after(at.saturating_duration_since(now));
+            }
+        }
         self.layout();
+    }
+
+    pub fn set_subtitle(&mut self, path: &Path) {
+        self.subtitle_file = Some(path.to_path_buf());
+        self.subtitle_reload_at = None;
+        self.reload_subtitle();
+    }
+
+    fn reload_subtitle(&mut self) {
+        let Some(path) = self.subtitle_file.clone() else {
+            return;
+        };
+        self.pending_subtitle = Some(path);
+        if unsafe { libvlc_media_player_get_time(self.mp) } >= 0 {
+            self.apply_subtitle();
+        }
+    }
+
+    fn apply_subtitle(&mut self) {
+        let Some(path) = self.pending_subtitle.take() else {
+            return;
+        };
+        let scale = self.subtitle_scale;
+        let load = if crate::ass::is_ass_file(&path) && scale != SUBTITLE_SCALE_DEFAULT {
+            crate::ass::write_scaled_copy(&path, scale).unwrap_or_else(|| path.clone())
+        } else {
+            path.clone()
+        };
+        let Ok(cpath) = CString::new(load.as_os_str().as_encoded_bytes()) else {
+            eprintln!("subtitle path is not valid: {}", load.display());
+            return;
+        };
+        if unsafe { libvlc_video_set_subtitle_file(self.mp, cpath.as_ptr()) } == 0 {
+            eprintln!("subtitle load failed: {}", path.display());
+            return;
+        }
+        self.loaded_subtitle_scale = scale;
+        self.hidden_subtitle = None;
+    }
+
+    fn scales_by_reload(&self) -> bool {
+        self.subtitle_file
+            .as_deref()
+            .is_some_and(crate::ass::is_ass_file)
+    }
+
+    pub fn set_subtitle_scale(&mut self, percent: i64) {
+        self.subtitle_scale = percent;
+        if let Some(api) = var_api() {
+            let value = VlcValue { i_int: percent };
+            unsafe {
+                (api.set)(
+                    self.mp.cast(),
+                    SUB_TEXT_SCALE.as_ptr(),
+                    VLC_VAR_INTEGER,
+                    value,
+                )
+            };
+        }
+        self.subtitle_reload_at = (self.scales_by_reload()
+            && percent != self.loaded_subtitle_scale)
+            .then(|| Instant::now() + Duration::from_millis(SUBTITLE_RELOAD_DEBOUNCE_MS));
+    }
+
+    pub fn toggle_subtitles(&mut self) {
+        let current = unsafe { libvlc_video_get_spu(self.mp) };
+        if current != -1 {
+            self.hidden_subtitle = Some(current);
+            unsafe { libvlc_video_set_spu(self.mp, -1) };
+            return;
+        }
+        if self.scales_by_reload() && self.loaded_subtitle_scale != self.subtitle_scale {
+            self.subtitle_reload_at = None;
+            self.reload_subtitle();
+            return;
+        }
+        let target = self
+            .hidden_subtitle
+            .take()
+            .or_else(|| self.first_subtitle_track());
+        if let Some(id) = target {
+            unsafe { libvlc_video_set_spu(self.mp, id) };
+        }
+    }
+
+    fn first_subtitle_track(&self) -> Option<i32> {
+        let head = unsafe { libvlc_video_get_spu_description(self.mp) };
+        let mut node = head;
+        let mut found = None;
+        while !node.is_null() {
+            let track = unsafe { &*node };
+            if track.i_id != -1 {
+                found = Some(track.i_id);
+                break;
+            }
+            node = track.p_next;
+        }
+        if !head.is_null() {
+            unsafe { libvlc_track_description_list_release(head) };
+        }
+        found
     }
 
     /// Turn the view by `quarters` clockwise quarter-turns (3 = one turn
@@ -787,6 +987,14 @@ mod seek_tests {
     }
 
     #[test]
+    fn subtitle_scale_steps_and_clamps() {
+        assert_eq!(step_subtitle_scale(SUBTITLE_SCALE_DEFAULT, 1), 110);
+        assert_eq!(step_subtitle_scale(SUBTITLE_SCALE_DEFAULT, -1), 90);
+        assert_eq!(step_subtitle_scale(10, -1), 10);
+        assert_eq!(step_subtitle_scale(500, 1), 500);
+    }
+
+    #[test]
     fn internal_audio_suppression_never_overrides_user_mute() {
         assert!(effective_mute(true, false, false));
         assert!(effective_mute(false, true, false));
@@ -1008,6 +1216,21 @@ unsafe extern "C" {
         mp: *mut libvlc_media_player_t,
     ) -> *mut libvlc_track_description_t;
     fn libvlc_track_description_list_release(tracks: *mut libvlc_track_description_t);
+    fn libvlc_video_set_subtitle_file(
+        mp: *mut libvlc_media_player_t,
+        path: *const c_char,
+    ) -> c_int;
     fn libvlc_audio_get_track(mp: *mut libvlc_media_player_t) -> c_int;
     fn libvlc_audio_set_track(mp: *mut libvlc_media_player_t, track: c_int) -> c_int;
+    fn libvlc_video_get_spu(mp: *mut libvlc_media_player_t) -> c_int;
+    fn libvlc_video_set_spu(mp: *mut libvlc_media_player_t, spu: c_int) -> c_int;
+    fn libvlc_video_get_spu_description(
+        mp: *mut libvlc_media_player_t,
+    ) -> *mut libvlc_track_description_t;
+}
+
+const RTLD_DEFAULT: *mut c_void = -2isize as *mut c_void;
+
+unsafe extern "C" {
+    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
 }

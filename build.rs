@@ -20,5 +20,6 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=CoreFoundation");
         // CATransform3DMakeRotation / CATransaction for rotating the video view.
         println!("cargo:rustc-link-lib=framework=QuartzCore");
+        println!("cargo:rustc-link-lib=framework=UniformTypeIdentifiers");
     }
 }

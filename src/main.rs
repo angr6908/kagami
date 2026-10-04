@@ -16,8 +16,10 @@ use archive::{Item, READ_CHUNK, VideoSource, has_ext, is_archive_file, scan_arch
 mod pdf;
 use pdf::{PdfImage, is_pdf_file, scan_pdf};
 
+mod ass;
+
 mod video;
-use video::{VideoPlayer, is_video_file};
+use video::{SUBTITLE_EXTENSIONS, VideoPlayer, is_subtitle_file, is_video_file};
 
 #[cfg(target_os = "macos")]
 mod controls;
@@ -1041,6 +1043,8 @@ struct KagamiApp {
     /// The currently on-screen video and its index, if the current item is a
     /// video. Dropping it stops playback and tears down the audio stream.
     video: Option<(usize, VideoPlayer)>,
+    video_host: Option<video::VideoHost>,
+    subtitle_scale: i64,
     video_error: Option<String>,
     /// Last playback position per video, keyed by (backing file, entry name),
     /// so navigating away and back resumes where the video left off.
@@ -1070,10 +1074,13 @@ struct KagamiApp {
     /// activation back to the previously active app asynchronously, which can
     /// land after a fixed number of frames — so re-assert on a time budget.
     focus_until: Option<std::time::Instant>,
+    first_ui_at: Option<std::time::Instant>,
 }
 
 impl KagamiApp {
     fn new(cc: &eframe::CreationContext<'_>, initial: Vec<PathBuf>) -> Self {
+        #[cfg(target_os = "macos")]
+        open_docs::set_repaint(cc.egui_ctx.clone());
         // Cap textures only at the GPU's max 2D dimension so uploads never panic;
         // images are otherwise decoded at their full resolution.
         let max_side = cc
@@ -1113,6 +1120,8 @@ impl KagamiApp {
             pan: egui::Vec2::ZERO,
             rotation: 0,
             video: None,
+            video_host: video::VideoHost::from_window(cc),
+            subtitle_scale: video::SUBTITLE_SCALE_DEFAULT,
             video_error: None,
             video_positions: HashMap::new(),
             #[cfg(target_os = "macos")]
@@ -1123,6 +1132,7 @@ impl KagamiApp {
             deleted: HashSet::new(),
             egui_ctx: cc.egui_ctx.clone(),
             focus_until: None,
+            first_ui_at: None,
         };
         app.request_focus(800);
         app.open_paths(initial);
@@ -1526,7 +1536,7 @@ impl KagamiApp {
 
     /// Make sure the video player matches the current item: tear down any player
     /// for a different (or non-video) item, and open one for a current video.
-    fn sync_video(&mut self) {
+    fn sync_video(&mut self, ctx: &egui::Context) {
         let cur = self.current_index;
         let is_video = is_video_file(self.items[cur].media_name());
 
@@ -1538,20 +1548,28 @@ impl KagamiApp {
             self.video = None;
             self.video_error = None;
         }
+        if is_video && self.video.is_none() && !video::libvlc_ready() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+            return;
+        }
         if is_video && self.video.is_none() {
             // libvlc renders natively into its own NSView over the window.
             // Archived videos play in place: stored entries straight from the
             // archive file, compressed ones from a decompressed buffer.
-            let opened = match self.items[cur].video_source() {
-                Some(VideoSource::Path(p)) => VideoPlayer::open(&p),
-                Some(VideoSource::FileRange { path, start, len }) => {
-                    VideoPlayer::open_range(&path, start, len)
-                }
-                Some(VideoSource::Bytes(data)) => VideoPlayer::open_bytes(data),
-                None => Err(anyhow::anyhow!("could not read the archive entry")),
+            let opened = match &self.video_host {
+                None => Err(anyhow::anyhow!("no window to attach the video view to")),
+                Some(host) => match self.items[cur].video_source() {
+                    Some(VideoSource::Path(p)) => VideoPlayer::open(&p, host),
+                    Some(VideoSource::FileRange { path, start, len }) => {
+                        VideoPlayer::open_range(&path, start, len, host)
+                    }
+                    Some(VideoSource::Bytes(data)) => VideoPlayer::open_bytes(data, host),
+                    None => Err(anyhow::anyhow!("could not read the archive entry")),
+                },
             };
             match opened {
                 Ok(mut player) => {
+                    player.set_subtitle_scale(self.subtitle_scale);
                     if let Some(&pos) = self.video_positions.get(&video_key(&self.items[cur]))
                         && pos > 1.0
                     {
@@ -1617,6 +1635,11 @@ impl eframe::App for KagamiApp {
         // running: switch to that selection and raise the window.
         #[cfg(target_os = "macos")]
         {
+            open_docs::ensure_installed();
+            let launched_at = *self.first_ui_at.get_or_insert_with(std::time::Instant::now);
+            if launched_at.elapsed() < Duration::from_millis(2000) {
+                ctx.request_repaint_after(Duration::from_millis(250));
+            }
             let opened = open_docs::drain();
             if !opened.is_empty() {
                 self.open_paths(opened);
@@ -1777,7 +1800,7 @@ impl eframe::App for KagamiApp {
                 }
 
                 // Open/close the video player to match the current item.
-                self.sync_video();
+                self.sync_video(&ctx);
 
                 let rect = ui.max_rect();
                 let cur = self.current_index;
@@ -1802,11 +1825,33 @@ impl eframe::App for KagamiApp {
                                 i.pointer.delta() != egui::Vec2::ZERO,
                             )
                         });
+                    let (sub_smaller, sub_larger, sub_toggle) = ui.input(|i| {
+                        (
+                            i.key_pressed(egui::Key::Minus),
+                            i.key_pressed(egui::Key::Equals) || i.key_pressed(egui::Key::Plus),
+                            i.key_pressed(egui::Key::Num0),
+                        )
+                    });
                     // Reveal the controls on any pointer movement or control key,
                     // then let them fade out after a few idle seconds of playback.
                     let acted = seek_back || seek_fwd || mute || space;
                     if moved || acted {
                         self.controls_until = time + 2.5;
+                    }
+
+                    let mut subtitle = ui.input(|i| {
+                        i.raw
+                            .dropped_files
+                            .iter()
+                            .filter_map(|f| f.path.clone())
+                            .find(|p| is_subtitle_file(p))
+                    });
+                    if self.video.is_some()
+                        && ui.input(|i| i.key_pressed(egui::Key::C) && i.modifiers.is_none())
+                    {
+                        let picked = pick_subtitle();
+                        self.request_focus(800);
+                        subtitle = picked.or(subtitle);
                     }
 
                     let mut dbl_fullscreen = false;
@@ -1850,6 +1895,9 @@ impl eframe::App for KagamiApp {
                                 NativeCmd::AudioTrack(track) => player.set_audio_track(track),
                             }
                         }
+                        if let Some(path) = &subtitle {
+                            player.set_subtitle(path);
+                        }
                         if seek_back {
                             player.seek_by(-video::SEEK_STEP);
                         }
@@ -1867,6 +1915,20 @@ impl eframe::App for KagamiApp {
                         }
                         if rot_reset {
                             player.reset_rotation();
+                        }
+                        if sub_smaller {
+                            self.subtitle_scale =
+                                video::step_subtitle_scale(self.subtitle_scale, -1);
+                        }
+                        if sub_larger {
+                            self.subtitle_scale =
+                                video::step_subtitle_scale(self.subtitle_scale, 1);
+                        }
+                        if sub_smaller || sub_larger {
+                            player.set_subtitle_scale(self.subtitle_scale);
+                        }
+                        if sub_toggle {
+                            player.toggle_subtitles();
                         }
                         // Save exactly the on-screen frame at full source
                         // resolution (libvlc writes the PNG directly).
@@ -1910,8 +1972,9 @@ impl eframe::App for KagamiApp {
                             };
                             if self.native_controls.is_none()
                                 && let Some(mtm) = objc2::MainThreadMarker::new()
-                                && let Some(c) = controls::NativeControls::new(mtm)
+                                && let Some(host) = &self.video_host
                             {
+                                let c = controls::NativeControls::new(mtm, host.view());
                                 c.set_callbacks(native_controls_callbacks(&self.shared, &ctx));
                                 self.native_controls = Some(c);
                             }
@@ -2196,6 +2259,66 @@ fn pick_paths() -> Vec<PathBuf> {
         .collect()
 }
 
+#[cfg(target_os = "macos")]
+fn launch_selection() -> Vec<PathBuf> {
+    let mut paths = open_docs::drain();
+    if paths.is_empty() {
+        paths = pick_paths();
+    }
+    if paths.is_empty() {
+        paths = open_docs::drain();
+    }
+    if paths.is_empty() {
+        std::process::exit(0);
+    }
+    paths
+}
+
+#[cfg(target_os = "macos")]
+fn pick_subtitle() -> Option<PathBuf> {
+    use objc2::MainThreadMarker;
+    use objc2::rc::Retained;
+    use objc2::runtime::{AnyClass, AnyObject};
+    use objc2::msg_send;
+    use objc2_app_kit::{NSModalResponseOK, NSOpenPanel};
+    use objc2_foundation::{NSArray, NSString};
+
+    let mtm = MainThreadMarker::new()?;
+    let panel = NSOpenPanel::openPanel(mtm);
+    panel.setCanChooseFiles(true);
+    panel.setCanChooseDirectories(false);
+    panel.setAllowsMultipleSelection(false);
+
+    if let Some(class) = AnyClass::get(c"UTType") {
+        let types: Vec<Retained<AnyObject>> = SUBTITLE_EXTENSIONS
+            .iter()
+            .filter_map(|ext| unsafe {
+                msg_send![class, typeWithFilenameExtension: &*NSString::from_str(ext)]
+            })
+            .collect();
+        let array = NSArray::from_retained_slice(&types);
+        unsafe {
+            let _: () = msg_send![&*panel, setAllowedContentTypes: &*array];
+        }
+    }
+
+    if panel.runModal() != NSModalResponseOK {
+        return None;
+    }
+    panel
+        .URLs()
+        .iter()
+        .find_map(|url| url.path().map(|p| PathBuf::from(p.to_string())))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn pick_subtitle() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Select subtitle file")
+        .add_filter("Subtitles", SUBTITLE_EXTENSIONS)
+        .pick_file()
+}
+
 /// Folder picker fallback for non-macOS platforms (rfd can't offer a combined
 /// file-or-folder dialog).
 #[cfg(not(target_os = "macos"))]
@@ -2209,8 +2332,7 @@ fn pick_paths() -> Vec<PathBuf> {
 /// macOS file associations: receive the paths Finder hands us when a media file
 /// is double-clicked or opened via "Open With Kagami". Finder does not pass these
 /// as argv — it sends an `odoc` Apple Event — so we install a handler that
-/// collects them, drain it each frame (opens in an already-running instance), and
-/// pump it once at launch before falling back to the picker.
+/// collects them and drain it each frame (opens in an already-running instance).
 #[cfg(target_os = "macos")]
 mod open_docs {
     use std::ffi::c_void;
@@ -2218,6 +2340,11 @@ mod open_docs {
     use std::sync::Mutex;
 
     static OPENED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    static REPAINT: std::sync::OnceLock<eframe::egui::Context> = std::sync::OnceLock::new();
+
+    pub fn set_repaint(ctx: eframe::egui::Context) {
+        let _ = REPAINT.set(ctx);
+    }
 
     #[repr(C)]
     struct AEDesc {
@@ -2246,6 +2373,13 @@ mod open_docs {
             id: u32,
             handler: Option<AEEventHandler>,
             refcon: *mut c_void,
+            is_sys: u8,
+        ) -> i32;
+        fn AEGetEventHandler(
+            cls: u32,
+            id: u32,
+            handler: *mut Option<AEEventHandler>,
+            refcon: *mut *mut c_void,
             is_sys: u8,
         ) -> i32;
         fn AEGetParamDesc(
@@ -2306,10 +2440,13 @@ mod open_docs {
             }
             AEDisposeDesc(&mut list);
         }
+        if let Some(ctx) = REPAINT.get() {
+            ctx.request_repaint();
+        }
         0
     }
 
-    /// Install the Open-Documents handler. Call once, before the event loop runs.
+    /// Install the Open-Documents handler.
     pub fn install() {
         unsafe {
             AEInstallEventHandler(
@@ -2322,41 +2459,42 @@ mod open_docs {
         }
     }
 
-    /// Best-effort at launch: pump the application event queue briefly so an
-    /// `odoc` already queued by LaunchServices is dispatched, then return the
-    /// opened paths (the handler stores a whole selection before returning, so
-    /// a non-empty queue is a complete batch). A bare CFRunLoop pump is not
-    /// enough — Apple Events only reach the installed handler when
-    /// NSApplication dequeues the event and routes it through `sendEvent:`.
-    pub fn take_pending(max_ms: u64) -> Vec<PathBuf> {
-        use objc2::MainThreadMarker;
-        use objc2_app_kit::{NSApplication, NSEventMask};
-        use objc2_foundation::{NSDate, NSDefaultRunLoopMode};
-
-        let Some(mtm) = MainThreadMarker::new() else {
-            return drain();
+    pub fn ensure_installed() {
+        let mut current: Option<AEEventHandler> = None;
+        let mut refcon: *mut c_void = std::ptr::null_mut();
+        let err = unsafe {
+            AEGetEventHandler(
+                fourcc(b"aevt"),
+                fourcc(b"odoc"),
+                &mut current,
+                &mut refcon,
+                0,
+            )
         };
-        let app = NSApplication::sharedApplication(mtm);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(max_ms);
-        loop {
-            let pending = drain();
-            if !pending.is_empty() {
-                return pending;
-            }
-            if std::time::Instant::now() >= deadline {
-                return Vec::new();
-            }
-            let event = unsafe {
-                app.nextEventMatchingMask_untilDate_inMode_dequeue(
-                    NSEventMask::Any,
-                    Some(&NSDate::dateWithTimeIntervalSinceNow(0.01)),
-                    NSDefaultRunLoopMode,
-                    true,
-                )
-            };
-            if let Some(event) = event {
-                app.sendEvent(&event);
-            }
+        let ours = current.is_some_and(|h| h as usize == handle_open as *const () as usize);
+        if err != 0 || !ours {
+            install();
+        }
+    }
+
+    pub fn install_at_launch() {
+        use block2::RcBlock;
+        use objc2::rc::Retained;
+        use objc2::runtime::AnyObject;
+        use objc2::{class, msg_send};
+        use objc2_app_kit::NSApplicationWillFinishLaunchingNotification;
+
+        let block = RcBlock::new(|_note: std::ptr::NonNull<AnyObject>| install());
+        unsafe {
+            let center: Retained<AnyObject> =
+                msg_send![class!(NSNotificationCenter), defaultCenter];
+            let _observer: Option<Retained<AnyObject>> = msg_send![
+                &*center,
+                addObserverForName: NSApplicationWillFinishLaunchingNotification,
+                object: None::<&AnyObject>,
+                queue: None::<&AnyObject>,
+                usingBlock: &*block
+            ];
         }
     }
 
@@ -2369,35 +2507,19 @@ mod open_docs {
 fn main() -> Result<()> {
     video::preload();
     #[cfg(target_os = "macos")]
-    open_docs::install();
+    open_docs::install_at_launch();
 
-    // Optional arguments: folders or media files to open. When absent (e.g.
-    // double-clicking the app) prompt up front, before the window exists. The
-    // native picker must run here, not from inside the egui event loop: on macOS
-    // a modal opened from within the loop returns immediately (the window
-    // flashed open and quit). Cancelling exits without opening a window.
-    let mut initial: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
-    if initial.is_empty() {
-        #[cfg(target_os = "macos")]
-        {
-            initial = open_docs::take_pending(300);
-            if initial.is_empty() {
-                initial = pick_paths();
-            }
-            // An `odoc` can also land while the picker modal is pumping events;
-            // if the picker is cancelled, still honor files arriving meanwhile.
-            if initial.is_empty() {
-                initial = open_docs::drain();
-            }
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            initial = pick_paths();
-        }
-        if initial.is_empty() {
+    let initial: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+    #[cfg(not(target_os = "macos"))]
+    let initial = if initial.is_empty() {
+        let picked = pick_paths();
+        if picked.is_empty() {
             return Ok(());
         }
-    }
+        picked
+    } else {
+        initial
+    };
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -2411,7 +2533,15 @@ fn main() -> Result<()> {
     eframe::run_native(
         "Kagami",
         options,
-        Box::new(move |cc| Ok(Box::new(KagamiApp::new(cc, initial)))),
+        Box::new(move |cc| {
+            #[cfg(target_os = "macos")]
+            let initial = if initial.is_empty() {
+                launch_selection()
+            } else {
+                initial
+            };
+            Ok(Box::new(KagamiApp::new(cc, initial)))
+        }),
     )
     .map_err(|e| anyhow::anyhow!("eframe error: {}", e))?;
 

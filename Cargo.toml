@@ -41,9 +41,10 @@ lopdf = { version = "0.44", default-features = false }
 # activation so the window comes to the front. The objc2 crates are already in
 # the tree (eframe/winit pull them), so depending on them is cheap.
 [target.'cfg(target_os = "macos")'.dependencies]
+raw-window-handle = "0.6"
 block2 = "0.6"
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSString", "NSGeometry", "NSURL", "NSDate", "NSRunLoop"] }
+objc2-foundation = { version = "0.3", features = ["NSString", "NSGeometry", "NSURL", "NSDate", "NSRunLoop", "NSArray"] }
 objc2-app-kit = { version = "0.3", features = [
     "block2",
     "NSResponder", "NSWindow", "NSPanel", "NSSavePanel", "NSOpenPanel",
