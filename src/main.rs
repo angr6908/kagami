@@ -45,6 +45,12 @@ const MAX_DECODE_RETRIES: usize = 3;
 // pages be ready by the time navigation reaches them.
 const EXPAND_AHEAD: usize = 3;
 const EXPAND_BEHIND: usize = 1;
+// About 200 points of two-finger travel browses 20 items. Keep each frame's
+// jump bounded, so a large wheel event cannot skip an entire folder at once.
+const SCROLL_POINTS_PER_ITEM: f32 = 10.0;
+const MAX_SCROLL_STEP: isize = 20;
+const IMAGE_UPLOAD_IDLE_SECS: f64 = 0.04;
+const VIDEO_OPEN_IDLE_SECS: f64 = 0.1;
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "gif", "tiff"];
 /// eframe Storage key for the saved playback-panel position.
 const PANEL_POS_KEY: &str = "playback_panel_pos";
@@ -57,6 +63,134 @@ const PANEL_POS_KEY: &str = "playback_panel_pos";
 struct PanelPosition {
     horizontal: f32,
     vertical: f32,
+}
+
+/// Turn raw scroll distance into item steps. Fractions carry across events, so
+/// a slow swipe still advances, and a fast swipe advances farther.
+/// Positive Y means fingers down and therefore browses backward.
+fn browse_scroll_steps(remainder: &mut f32, delta_y: f32) -> isize {
+    if delta_y == 0.0 {
+        return 0;
+    }
+    if *remainder != 0.0 && remainder.signum() != delta_y.signum() {
+        *remainder = 0.0;
+    }
+    *remainder += delta_y;
+    let whole_steps = (*remainder / SCROLL_POINTS_PER_ITEM).trunc() as isize;
+    *remainder -= whole_steps as f32 * SCROLL_POINTS_PER_ITEM;
+    -whole_steps.clamp(-MAX_SCROLL_STEP, MAX_SCROLL_STEP)
+}
+
+#[derive(Default)]
+struct BrowseScroll {
+    remainder: f32,
+    last_event_at: f64,
+}
+
+impl BrowseScroll {
+    /// Returns (item steps, whether the user scrolled). Raw events have no
+    /// egui smoothing tail; the macOS event monitor below also drops inertial
+    /// events after the fingers lift.
+    fn steps(&mut self, events: &[egui::Event], time: f64) -> (isize, bool) {
+        if time - self.last_event_at > 0.15 {
+            self.remainder = 0.0;
+        }
+        let mut steps = 0;
+        let mut moved = false;
+        for event in events {
+            let egui::Event::MouseWheel {
+                unit,
+                delta,
+                phase,
+                modifiers,
+            } = event
+            else {
+                continue;
+            };
+            match phase {
+                egui::TouchPhase::Start | egui::TouchPhase::End | egui::TouchPhase::Cancel => {
+                    self.remainder = 0.0;
+                }
+                egui::TouchPhase::Move => {
+                    if modifiers.ctrl || modifiers.command || delta.y.abs() <= delta.x.abs() {
+                        continue;
+                    }
+                    let points = match unit {
+                        egui::MouseWheelUnit::Point => delta.y,
+                        egui::MouseWheelUnit::Line => delta.y * 16.0,
+                        egui::MouseWheelUnit::Page => delta.y * 200.0,
+                    };
+                    moved = true;
+                    self.last_event_at = time;
+                    steps += browse_scroll_steps(&mut self.remainder, points);
+                }
+            }
+        }
+        (steps.clamp(-MAX_SCROLL_STEP, MAX_SCROLL_STEP), moved)
+    }
+}
+
+/// AppKit marks kinetic trackpad events with a momentum phase, but winit folds
+/// that into the same wheel event as finger movement. Drop those events before
+/// egui sees them so browsing stops as soon as the fingers lift.
+#[cfg(target_os = "macos")]
+struct ScrollMomentumMonitor(objc2::rc::Retained<objc2::runtime::AnyObject>);
+
+#[cfg(target_os = "macos")]
+impl ScrollMomentumMonitor {
+    fn install() -> Option<Self> {
+        use block2::RcBlock;
+        use objc2_app_kit::{NSEvent, NSEventMask, NSEventPhase};
+        let filter = RcBlock::new(|event: std::ptr::NonNull<NSEvent>| {
+            if unsafe { event.as_ref().momentumPhase() } == NSEventPhase::None {
+                event.as_ptr()
+            } else {
+                std::ptr::null_mut()
+            }
+        });
+        // SAFETY: the block returns the original live event or null, as AppKit
+        // requires. AppKit copies the block for the lifetime of the monitor.
+        unsafe {
+            NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::ScrollWheel, &filter)
+        }
+        .map(Self)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for ScrollMomentumMonitor {
+    fn drop(&mut self) {
+        use objc2_app_kit::NSEvent;
+        // SAFETY: this is the monitor token returned by AppKit at install.
+        unsafe { NSEvent::removeMonitor(&self.0) };
+    }
+}
+
+/// Move through live items without wrapping at the ends of a fast browse.
+fn fast_browse_index(
+    start: usize,
+    dir: isize,
+    steps: usize,
+    count: usize,
+    deleted: &HashSet<usize>,
+) -> usize {
+    let mut index = start;
+    let mut last_live = start;
+    let mut remaining = steps;
+    while remaining > 0 {
+        let next = if dir > 0 {
+            (index + 1 < count).then_some(index + 1)
+        } else {
+            index.checked_sub(1)
+        };
+        let Some(next) = next else { break };
+        index = next;
+        if !deleted.contains(&index) {
+            last_live = index;
+            remaining -= 1;
+        }
+    }
+    last_live
 }
 
 /// A fixed-size pool of worker threads pulling jobs off a shared channel. This
@@ -117,6 +251,8 @@ enum DecodeOutcome {
 struct SharedState {
     current_idx: AtomicUsize,
     image_count: AtomicUsize,
+    /// Pause speculative work while a fast scroll is still changing the view.
+    browsing: AtomicBool,
     /// Set when a newer pipeline supersedes this one, so its coordinator (which
     /// otherwise loops forever) exits instead of spinning on a stale list.
     cancelled: AtomicBool,
@@ -442,7 +578,7 @@ fn hydrate_file(path: &Path, idx: usize, shared: &SharedState, max_dist: usize) 
     };
     let mut buf = vec![0u8; READ_CHUNK];
     loop {
-        if !still_relevant(idx, shared, max_dist) {
+        if shared.browsing.load(Ordering::Relaxed) || !still_relevant(idx, shared, max_dist) {
             return false;
         }
         match f.read(&mut buf) {
@@ -631,20 +767,22 @@ fn spawn_decode(
                 DecodeOutcome::Aborted
             } else {
                 match item.pdf_image().and_then(|img| pdf_decoded(img, max_side)) {
-                    Some(decoded) => {
+                    Some(decoded) if !cancelled() => {
                         let _ = decoded_tx.send((idx, decoded));
                         DecodeOutcome::Ok
                     }
+                    Some(_) => DecodeOutcome::Aborted,
                     None => DecodeOutcome::Failed,
                 }
             }
         } else {
             match item.read(&cancelled) {
                 Some(data) => match decode_from_bytes(&data, max_side) {
-                    Ok(decoded) => {
+                    Ok(decoded) if !cancelled() => {
                         let _ = decoded_tx.send((idx, decoded));
                         DecodeOutcome::Ok
                     }
+                    Ok(_) => DecodeOutcome::Aborted,
                     Err(_) => DecodeOutcome::Failed,
                 },
                 // `read` bails on both a stale index and an I/O/archive error;
@@ -771,7 +909,7 @@ fn run_coordinator(
 
         // Only fan out look-ahead once the current image is showing, so it never
         // competes with the visible image for OneDrive bandwidth or CPU.
-        if current_ready {
+        if current_ready && !shared.browsing.load(Ordering::Relaxed) {
             // Decode the immediate neighbours so adjacent navigation is instant.
             for idx in window_indices(cur, count, DECODE_AHEAD, DECODE_BEHIND) {
                 if state.dc_in_flight.len() >= max_dc_in_flight {
@@ -984,6 +1122,21 @@ struct CachedImage {
     delays: Vec<f32>,
 }
 
+/// Decoded pixels waiting for a small, paced upload on the UI thread.
+struct PendingUpload {
+    size: [usize; 2],
+    frames: std::vec::IntoIter<(Vec<u8>, f32)>,
+}
+
+impl From<Decoded> for PendingUpload {
+    fn from(decoded: Decoded) -> Self {
+        Self {
+            size: [decoded.width as usize, decoded.height as usize],
+            frames: decoded.frames.into_iter(),
+        }
+    }
+}
+
 impl CachedImage {
     /// Frame to draw at absolute time `t` and the seconds until the next
     /// frame change (infinite for stills, so no repaint gets scheduled).
@@ -1013,6 +1166,7 @@ struct KagamiApp {
     root: PathBuf,
     current_index: usize,
     cache: HashMap<usize, CachedImage>,
+    pending_uploads: HashMap<usize, PendingUpload>,
     decoded_rx: Receiver<(usize, Decoded)>,
     /// Receives the result of the current off-thread folder scan, if one is
     /// running. Replacing it (a newer open) drops this receiver so a stale
@@ -1040,6 +1194,10 @@ struct KagamiApp {
     /// left, T resets.
     /// Display-only — the file is untouched — and reset on navigation.
     rotation: u8,
+    browse_scroll: BrowseScroll,
+    last_browse_at: f64,
+    #[cfg(target_os = "macos")]
+    _scroll_momentum_monitor: Option<ScrollMomentumMonitor>,
     /// The currently on-screen video and its index, if the current item is a
     /// video. Dropping it stops playback and tears down the audio stream.
     video: Option<(usize, VideoPlayer)>,
@@ -1099,6 +1257,7 @@ impl KagamiApp {
             root: PathBuf::new(),
             current_index: 0,
             cache: HashMap::new(),
+            pending_uploads: HashMap::new(),
             decoded_rx,
             scan_rx: None,
             scanning: false,
@@ -1108,6 +1267,7 @@ impl KagamiApp {
             shared: Arc::new(SharedState {
                 current_idx: AtomicUsize::new(0),
                 image_count: AtomicUsize::new(0),
+                browsing: AtomicBool::new(false),
                 cancelled: AtomicBool::new(false),
                 #[cfg(target_os = "macos")]
                 native_cmds: Mutex::new(Vec::new()),
@@ -1119,6 +1279,10 @@ impl KagamiApp {
             zoom: 1.0,
             pan: egui::Vec2::ZERO,
             rotation: 0,
+            browse_scroll: BrowseScroll::default(),
+            last_browse_at: f64::NEG_INFINITY,
+            #[cfg(target_os = "macos")]
+            _scroll_momentum_monitor: ScrollMomentumMonitor::install(),
             video: None,
             video_host: video::VideoHost::from_window(cc),
             subtitle_scale: video::SUBTITLE_SCALE_DEFAULT,
@@ -1173,6 +1337,7 @@ impl KagamiApp {
     fn tear_down(&mut self) {
         self.root = PathBuf::new();
         self.cache.clear();
+        self.pending_uploads.clear();
         self.deleted.clear();
         self.expanding.clear();
         self.video = None;
@@ -1180,6 +1345,8 @@ impl KagamiApp {
         self.video_positions.clear();
         self.last_title_index = None;
         self.rotation = 0;
+        self.browse_scroll = BrowseScroll::default();
+        self.last_browse_at = f64::NEG_INFINITY;
         self.reset_zoom();
         self.start_coordinator(Arc::new(Vec::new()), 0);
     }
@@ -1190,6 +1357,7 @@ impl KagamiApp {
         let ScanResult { root, items } = result;
         self.root = root;
         self.cache.clear();
+        self.pending_uploads.clear();
         self.deleted.clear();
         self.expanding.clear();
         self.video = None;
@@ -1197,6 +1365,8 @@ impl KagamiApp {
         self.video_positions.clear();
         self.last_title_index = None;
         self.rotation = 0;
+        self.browse_scroll = BrowseScroll::default();
+        self.last_browse_at = f64::NEG_INFINITY;
         self.reset_zoom();
         self.start_coordinator(Arc::new(items), 0);
     }
@@ -1209,6 +1379,7 @@ impl KagamiApp {
         let shared = Arc::new(SharedState {
             current_idx: AtomicUsize::new(current_index),
             image_count: AtomicUsize::new(items.len()),
+            browsing: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
             #[cfg(target_os = "macos")]
             native_cmds: Mutex::new(Vec::new()),
@@ -1312,6 +1483,10 @@ impl KagamiApp {
             }
         }
         self.cache = new_cache;
+        self.pending_uploads = std::mem::take(&mut self.pending_uploads)
+            .into_iter()
+            .filter_map(|(idx, upload)| remap(idx).map(|new_idx| (new_idx, upload)))
+            .collect();
         self.deleted = self.deleted.iter().filter_map(|&i| remap(i)).collect();
         self.video = self
             .video
@@ -1369,6 +1544,7 @@ impl KagamiApp {
         }
         self.deleted.insert(cur);
         self.cache.remove(&cur);
+        self.pending_uploads.remove(&cur);
         if matches!(&self.video, Some((i, _)) if *i == cur) {
             self.video = None;
             self.video_error = None;
@@ -1536,7 +1712,7 @@ impl KagamiApp {
 
     /// Make sure the video player matches the current item: tear down any player
     /// for a different (or non-video) item, and open one for a current video.
-    fn sync_video(&mut self, ctx: &egui::Context) {
+    fn sync_video(&mut self, ctx: &egui::Context, allow_open: bool) {
         let cur = self.current_index;
         let is_video = is_video_file(self.items[cur].media_name());
 
@@ -1547,6 +1723,9 @@ impl KagamiApp {
                 .insert(video_key(&self.items[*idx]), player.position());
             self.video = None;
             self.video_error = None;
+        }
+        if !allow_open {
+            return;
         }
         if is_video && self.video.is_none() && !video::libvlc_ready() {
             ctx.request_repaint_after(Duration::from_millis(50));
@@ -1607,6 +1786,71 @@ impl KagamiApp {
         let max = DECODE_AHEAD.max(DECODE_BEHIND) + 1;
         self.cache
             .retain(|&idx, _| circular_dist(idx, cur, count) <= max);
+        self.pending_uploads
+            .retain(|&idx, _| circular_dist(idx, cur, count) <= max);
+    }
+
+    /// Drain completed decodes after navigation, keeping only results near the
+    /// new current item. Pixel buffers stay in RAM until a paced upload below.
+    fn receive_decoded(&mut self) {
+        let count = self.items.len();
+        let cur = self.current_index;
+        let max = DECODE_AHEAD.max(DECODE_BEHIND) + 1;
+        while let Ok((idx, decoded)) = self.decoded_rx.try_recv() {
+            if idx >= count
+                || circular_dist(idx, cur, count) > max
+                || self.deleted.contains(&idx)
+                || self.cache.contains_key(&idx)
+                || self.pending_uploads.contains_key(&idx)
+            {
+                continue;
+            }
+            self.pending_uploads.insert(idx, decoded.into());
+        }
+    }
+
+    /// Upload at most one frame per UI pass. Show the current item's first frame
+    /// before prefetching neighbours, leaving GPU time for input and painting.
+    fn upload_one_frame(&mut self, ctx: &egui::Context, allow_prefetch: bool) {
+        let cur = self.current_index;
+        let current_pending = self.pending_uploads.contains_key(&cur);
+        let index = if current_pending && !self.cache.contains_key(&cur) {
+            Some(cur)
+        } else if allow_prefetch {
+            self.pending_uploads
+                .keys()
+                .filter(|&&idx| idx != cur)
+                .min_by_key(|&&idx| circular_dist(idx, cur, self.items.len()))
+                .copied()
+                .or(current_pending.then_some(cur))
+        } else {
+            current_pending.then_some(cur)
+        };
+        let Some(index) = index else { return };
+        let pending = self.pending_uploads.get_mut(&index).unwrap();
+        let Some((rgba, delay)) = pending.frames.next() else {
+            self.pending_uploads.remove(&index);
+            return;
+        };
+        let frame_index = self.cache.get(&index).map_or(0, |image| image.frames.len());
+        let image = egui::ColorImage::from_rgba_unmultiplied(pending.size, &rgba);
+        let texture = ctx.load_texture(
+            format!("Kagami_{index}_{frame_index}"),
+            image,
+            egui::TextureOptions::LINEAR,
+        );
+        let cached = self.cache.entry(index).or_insert_with(|| CachedImage {
+            frames: Vec::new(),
+            delays: Vec::new(),
+        });
+        cached.frames.push(texture);
+        cached.delays.push(delay);
+        if pending.frames.len() == 0 {
+            self.pending_uploads.remove(&index);
+        }
+        if !self.pending_uploads.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
     }
 
     fn update_title(&mut self, ctx: &egui::Context) {
@@ -1618,9 +1862,12 @@ impl KagamiApp {
         let name = self.items[self.current_index].display(&self.root);
         // Count by non-deleted files so the position stays sensible after trashing.
         let total = self.items.len() - self.deleted.len();
-        let ordinal = (0..=self.current_index)
-            .filter(|i| !self.deleted.contains(i))
-            .count();
+        let ordinal = self.current_index + 1
+            - self
+                .deleted
+                .iter()
+                .filter(|&&idx| idx <= self.current_index)
+                .count();
         let title = format!("[{ordinal}/{total}] {name} - Kagami");
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
         self.last_title_index = Some(self.current_index);
@@ -1669,29 +1916,6 @@ impl eframe::App for KagamiApp {
             self.scan_rx = None;
             self.scanning = false;
             self.install_scanned(result);
-        }
-
-        // Fold in any archive/PDF that finished expanding.
-        while let Ok(res) = self.expand_rx.try_recv() {
-            self.apply_expansion(res);
-        }
-
-        while let Ok((index, decoded)) = self.decoded_rx.try_recv() {
-            self.cache.entry(index).or_insert_with(|| {
-                let size = [decoded.width as usize, decoded.height as usize];
-                let mut frames = Vec::with_capacity(decoded.frames.len());
-                let mut delays = Vec::with_capacity(decoded.frames.len());
-                for (i, (rgba, delay)) in decoded.frames.iter().enumerate() {
-                    let img = egui::ColorImage::from_rgba_unmultiplied(size, rgba);
-                    frames.push(ctx.load_texture(
-                        format!("Kagami_{index}_{i}"),
-                        img,
-                        egui::TextureOptions::LINEAR,
-                    ));
-                    delays.push(*delay);
-                }
-                CachedImage { frames, delays }
-            });
         }
 
         egui::CentralPanel::no_frame()
@@ -1767,6 +1991,33 @@ impl eframe::App for KagamiApp {
                     changed = true;
                 }
 
+                // Trackpad deltas are already smooth; accumulating the raw
+                // travel keeps the browse speed proportional to the swipe
+                // without egui's delayed wheel smoothing tail.
+                let (time, zooming) = ui.input(|i| (i.time, i.zoom_delta() != 1.0));
+                if self.zoom <= 1.0 && !zooming {
+                    let (steps, moved) =
+                        ui.input(|i| self.browse_scroll.steps(&i.raw.events, i.time));
+                    if moved {
+                        self.last_browse_at = time;
+                    }
+                    if steps != 0 {
+                        let n = fast_browse_index(
+                            self.current_index,
+                            steps.signum(),
+                            steps.unsigned_abs(),
+                            self.items.len(),
+                            &self.deleted,
+                        );
+                        if n != self.current_index {
+                            self.current_index = n;
+                            changed = true;
+                        }
+                    }
+                } else {
+                    self.browse_scroll.remainder = 0.0;
+                }
+
                 if changed {
                     self.shared
                         .current_idx
@@ -1775,8 +2026,31 @@ impl eframe::App for KagamiApp {
                     self.reset_zoom();
                 }
 
-                // Read any archive/PDF the view has come near (and only those).
-                self.maybe_expand();
+                let idle = time - self.last_browse_at;
+                let browsing = idle < VIDEO_OPEN_IDLE_SECS;
+                self.shared.browsing.store(browsing, Ordering::Relaxed);
+                if browsing {
+                    ctx.request_repaint_after(Duration::from_secs_f64(VIDEO_OPEN_IDLE_SECS - idle));
+                } else {
+                    // Container expansion sorts the browse list, so apply at
+                    // most one result per frame after the scroll has settled.
+                    if let Ok(result) = self.expand_rx.try_recv() {
+                        self.apply_expansion(result);
+                        if !self.expand_rx.is_empty() {
+                            ctx.request_repaint();
+                        }
+                    }
+                    self.maybe_expand();
+                }
+
+                self.receive_decoded();
+                if idle >= IMAGE_UPLOAD_IDLE_SECS {
+                    self.upload_one_frame(&ctx, !browsing);
+                } else if self.pending_uploads.contains_key(&self.current_index) {
+                    ctx.request_repaint_after(Duration::from_secs_f64(
+                        IMAGE_UPLOAD_IDLE_SECS - idle,
+                    ));
+                }
 
                 self.update_title(ui.ctx());
 
@@ -1799,8 +2073,9 @@ impl eframe::App for KagamiApp {
                     }
                 }
 
-                // Open/close the video player to match the current item.
-                self.sync_video(&ctx);
+                // Starting each intermediate video stalls a fast swipe. Drop
+                // the old player immediately, then open only the settled item.
+                self.sync_video(&ctx, !browsing);
 
                 let rect = ui.max_rect();
                 let cur = self.current_index;
@@ -2068,6 +2343,62 @@ mod tests {
     use super::*;
     use image::codecs::jpeg::JpegEncoder;
 
+    #[test]
+    fn fast_browse_moves_twenty_live_items_and_stops_at_ends() {
+        let deleted = HashSet::from([5, 6, 28, 29]);
+        assert_eq!(fast_browse_index(0, 1, 20, 50, &deleted), 22);
+        assert_eq!(fast_browse_index(22, -1, 20, 50, &deleted), 0);
+        assert_eq!(fast_browse_index(30, 1, 20, 50, &deleted), 49);
+        assert_eq!(fast_browse_index(30, -1, 20, 50, &deleted), 8);
+        assert_eq!(fast_browse_index(0, -1, 20, 50, &deleted), 0);
+        assert_eq!(fast_browse_index(49, 1, 20, 50, &deleted), 49);
+    }
+
+    #[test]
+    fn scroll_distance_controls_steps_and_reversal() {
+        let mut remainder = 0.0;
+        assert_eq!(browse_scroll_steps(&mut remainder, 4.0), 0);
+        assert_eq!(browse_scroll_steps(&mut remainder, 16.0), -2);
+        assert_eq!(browse_scroll_steps(&mut remainder, 200.0), -20);
+        assert_eq!(browse_scroll_steps(&mut remainder, -5.0), 0);
+        assert_eq!(browse_scroll_steps(&mut remainder, -25.0), 3);
+        assert_eq!(browse_scroll_steps(&mut remainder, -500.0), 20);
+        assert_eq!(remainder, 0.0, "large deltas leave no delayed jump");
+    }
+
+    #[test]
+    fn raw_scroll_stops_at_gesture_end() {
+        let wheel = |y, phase| egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, y),
+            phase,
+            modifiers: egui::Modifiers::default(),
+        };
+        let mut scroll = BrowseScroll::default();
+        assert_eq!(
+            scroll.steps(&[wheel(0.0, egui::TouchPhase::Start)], 1.0),
+            (0, false)
+        );
+        assert_eq!(
+            scroll.steps(&[wheel(4.0, egui::TouchPhase::Move)], 1.01),
+            (0, true)
+        );
+        assert_eq!(
+            scroll.steps(&[wheel(16.0, egui::TouchPhase::Move)], 1.02),
+            (-2, true)
+        );
+        assert_eq!(
+            scroll.steps(&[wheel(0.0, egui::TouchPhase::End)], 1.03),
+            (0, false)
+        );
+        assert_eq!(scroll.steps(&[], 1.04), (0, false));
+        assert_eq!(scroll.remainder, 0.0);
+        assert_eq!(
+            scroll.steps(&[wheel(-20.0, egui::TouchPhase::Move)], 1.05),
+            (2, true)
+        );
+    }
+
     fn encode_jpeg(w: u32, h: u32) -> Vec<u8> {
         let buf = image::RgbImage::from_pixel(w, h, image::Rgb([120, 80, 40]));
         let mut out = Vec::new();
@@ -2277,9 +2608,9 @@ fn launch_selection() -> Vec<PathBuf> {
 #[cfg(target_os = "macos")]
 fn pick_subtitle() -> Option<PathBuf> {
     use objc2::MainThreadMarker;
+    use objc2::msg_send;
     use objc2::rc::Retained;
     use objc2::runtime::{AnyClass, AnyObject};
-    use objc2::msg_send;
     use objc2_app_kit::{NSModalResponseOK, NSOpenPanel};
     use objc2_foundation::{NSArray, NSString};
 
