@@ -2,10 +2,23 @@ name: Release
 
 on:
   push:
-    tags: ['v*']
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'build.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
+      - 'scripts/**'
+      - 'assets/**'
+      - '.github/workflows/release.yml'
 
 permissions:
   contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   release:
@@ -36,7 +49,7 @@ jobs:
 
       - name: Package Kagami.app  # .app bundle launches without a terminal
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
           app="Kagami.app"
           mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
           cp target/release/Kagami "$app/Contents/MacOS/"
@@ -97,7 +110,7 @@ jobs:
           mv "$app" "$dmg_root/"
           ln -s /Applications "$dmg_root/Applications"
           for attempt in 1 2 3; do
-            if diskutil image create from --format ULFO --volumeName Kagami "$dmg_root" "Kagami-${GITHUB_REF_NAME}.dmg"; then
+            if diskutil image create from --format ULFO --volumeName Kagami "$dmg_root" "Kagami.dmg"; then
               break
             fi
             if [ "$attempt" = 3 ]; then
@@ -106,6 +119,15 @@ jobs:
             sleep 5
           done
 
+      - name: Point the release at this commit
+        run: |
+          git tag -f latest "$GITHUB_SHA"
+          git push -f origin refs/tags/latest
+
       - uses: softprops/action-gh-release@v3
         with:
-          files: Kagami-*.dmg
+          tag_name: latest
+          name: Kagami
+          files: Kagami.dmg
+          overwrite_files: true
+          make_latest: true
